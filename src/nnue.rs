@@ -277,27 +277,35 @@ impl Nnue {
         hand
     }
 
-    // Accumulator of one perspective in ACT_SCALE units: bias, one table row per piece, and
-    // the pieces in hand as precomputed rows (hand_w column times count), clipped to [0, 127].
-    fn accumulate(&self, board: &Board, color: Color, act: &mut [u8; MAX_HIDDEN]) {
+    // Bias plus one table row per piece, for the perspective `color`, into `acc`.
+    fn accumulate_pieces(&self, board: &Board, color: Color, acc: &mut [i16]) {
         let h = self.hidden;
-        let mut acc = [0i16; MAX_HIDDEN];
         acc[..h].copy_from_slice(&self.hand_b);
         let mut feats = [0; MAX_PIECES];
         let n = self.features_into(board, color, &mut feats);
         for &f in &feats[..n] {
             add_row(&mut acc[..h], &self.ft[f * h..(f + 1) * h]);
         }
+    }
+
+    fn hand_row(&self, slot: usize, count: usize) -> &[i16] {
+        let h = self.hidden;
+        let row = (slot * (MAX_COUNT + 1) + count.min(MAX_COUNT)) * h;
+        &self.hand_rows[row..row + h]
+    }
+
+    // Activations of one perspective from scratch (a board without accumulators).
+    fn activations(&self, board: &Board, color: Color, act: &mut [u8; MAX_HIDDEN]) {
+        let h = self.hidden;
+        let mut acc = [0i16; MAX_HIDDEN];
+        self.accumulate_pieces(board, color, &mut acc[..h]);
         for (slot, c) in [color as usize, color.other()].into_iter().enumerate() {
             for (j, bug) in BUG_ORDER.iter().enumerate() {
-                let count = (board.remaining[c][*bug as usize] as usize).min(MAX_COUNT);
-                let row = ((slot * 8 + j) * (MAX_COUNT + 1) + count) * h;
-                add_row(&mut acc[..h], &self.hand_rows[row..row + h]);
+                let count = board.remaining[c][*bug as usize] as usize;
+                add_row(&mut acc[..h], self.hand_row(slot * 8 + j, count));
             }
         }
-        for (a, v) in act[..h].iter_mut().zip(&acc[..h]) {
-            *a = (*v).clamp(0, ACT_SCALE as i16) as u8;
-        }
+        clip(&acc[..h], &mut act[..h]);
     }
 
     pub fn evaluate(&self, board: &Board) -> Evaluation {
@@ -306,8 +314,16 @@ impl Nnue {
         let h = self.hidden;
         let mut own = [0u8; MAX_HIDDEN];
         let mut opp = [0u8; MAX_HIDDEN];
-        self.accumulate(board, me, &mut own);
-        self.accumulate(board, them, &mut opp);
+        match board.nnue.as_deref() {
+            Some(state) if std::ptr::eq(&*state.net, self) => {
+                clip(&state.acc[me as usize][..h], &mut own[..h]);
+                clip(&state.acc[them as usize][..h], &mut opp[..h]);
+            }
+            _ => {
+                self.activations(board, me, &mut own);
+                self.activations(board, them, &mut opp);
+            }
+        }
         let mut x = [0u8; MAX_L2];
         for (i, row) in self.l1_w.chunks_exact(2 * h).enumerate() {
             let sum = dot(&own[..h], &row[..h]) + dot(&opp[..h], &row[h..]) + self.l1_b[i];
@@ -322,6 +338,105 @@ impl Nnue {
             self.out_w.iter().zip(&y).map(|(w, &a)| w * a as f32 / ACT_SCALE as f32).sum::<f32>()
                 + self.out_b;
         (out * self.scale).clamp(-SCORE_LIMIT, SCORE_LIMIT).round() as Evaluation
+    }
+}
+
+fn clip(acc: &[i16], act: &mut [u8]) {
+    for (a, v) in act.iter_mut().zip(acc) {
+        *a = (*v).clamp(0, ACT_SCALE as i16) as u8;
+    }
+}
+
+// Accumulators kept inside a Board: bias, one table row per piece on the board and one row
+// per (bug, count) in hand, for each perspective colour. Pieces are added and removed as
+// the board changes; a queen appearing or leaving changes the anchors, so that refreshes
+// both perspectives from scratch.
+#[derive(Clone)]
+pub struct NnueState {
+    net: Arc<Nnue>,
+    acc: [[i16; MAX_HIDDEN]; 2],
+}
+
+impl Board {
+    pub fn attach_nnue(&mut self, net: Arc<Nnue>) {
+        self.nnue = Some(Box::new(NnueState { net, acc: [[0; MAX_HIDDEN]; 2] }));
+        self.nnue_refresh();
+    }
+
+    fn nnue_refresh(&mut self) {
+        let mut state = self.nnue.take().unwrap();
+        let h = state.net.hidden;
+        for color in [Color::White, Color::Black] {
+            let acc = &mut state.acc[color as usize];
+            state.net.accumulate_pieces(self, color, acc);
+            for (slot, c) in [color as usize, color.other()].into_iter().enumerate() {
+                for (j, bug) in BUG_ORDER.iter().enumerate() {
+                    let count = self.remaining[c][*bug as usize] as usize;
+                    add_row(&mut acc[..h], state.net.hand_row(slot * 8 + j, count));
+                }
+            }
+        }
+        self.nnue = Some(state);
+    }
+
+    // After a piece landed on `hex` (placed or moved there).
+    pub(crate) fn nnue_on_insert(&mut self, hex: Hex, bug: Bug, color: Color) {
+        if bug == Bug::Queen {
+            return self.nnue_refresh();
+        }
+        let level = self.height(hex) - 1;
+        let mut state = self.nnue.take().unwrap();
+        let h = state.net.hidden;
+        for p in [Color::White, Color::Black] {
+            let (dq, dr) = Nnue::offset(hex, Nnue::anchor(self, p));
+            let f = state.net.feature(dq, dr, color != p, bug, level);
+            add_row(&mut state.acc[p as usize][..h], &state.net.ft[f * h..(f + 1) * h]);
+        }
+        self.nnue = Some(state);
+    }
+
+    // Before the top piece of `hex` leaves (moved away or a placement undone). A leaving
+    // queen only loses its own row here; the anchors are redone by the insert that completes
+    // a move, or by the hand change that completes an undone placement.
+    pub(crate) fn nnue_on_remove(&mut self, hex: Hex) {
+        let node = self.node(hex);
+        let level = self.height(hex) - 1;
+        let mut state = self.nnue.take().unwrap();
+        let h = state.net.hidden;
+        for p in [Color::White, Color::Black] {
+            let (dq, dr) = Nnue::offset(hex, Nnue::anchor(self, p));
+            let f = state.net.feature(dq, dr, node.color() != p, node.bug(), level);
+            sub_row(&mut state.acc[p as usize][..h], &state.net.ft[f * h..(f + 1) * h]);
+        }
+        self.nnue = Some(state);
+    }
+
+    // The count of `bug` in `color`'s hand changed by `delta` (the board already reflects it).
+    pub(crate) fn nnue_on_hand(&mut self, bug: Bug, color: Color, delta: i8) {
+        if bug == Bug::Queen {
+            return self.nnue_refresh();
+        }
+        let mut state = self.nnue.take().unwrap();
+        let h = state.net.hidden;
+        let now = self.remaining[color as usize][bug as usize] as usize;
+        let before = (now as i8 - delta) as usize;
+        for p in [Color::White, Color::Black] {
+            let slot = if color == p { 0 } else { 8 } + bug_index(bug);
+            sub_row(&mut state.acc[p as usize][..h], state.net.hand_row(slot, before));
+            add_row(&mut state.acc[p as usize][..h], state.net.hand_row(slot, now));
+        }
+        self.nnue = Some(state);
+    }
+}
+
+fn sub_row(acc: &mut [i16], row: &[i16]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature was detected at runtime.
+        return unsafe { avx2::sub_row(acc, row) };
+    }
+    for (a, w) in acc.iter_mut().zip(row) {
+        *a = a.saturating_sub(*w);
     }
 }
 
@@ -376,6 +491,19 @@ mod avx2 {
         }
         for i in n..acc.len().min(row.len()) {
             acc[i] = acc[i].saturating_add(row[i]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn sub_row(acc: &mut [i16], row: &[i16]) {
+        let n = acc.len().min(row.len()) / 16 * 16;
+        for i in (0..n).step_by(16) {
+            let a = _mm256_loadu_si256(acc.as_ptr().add(i) as *const __m256i);
+            let r = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+            _mm256_storeu_si256(acc.as_mut_ptr().add(i) as *mut __m256i, _mm256_subs_epi16(a, r));
+        }
+        for i in n..acc.len().min(row.len()) {
+            acc[i] = acc[i].saturating_sub(row[i]);
         }
     }
 
@@ -460,6 +588,61 @@ mod tests {
         assert_eq!(hand[0], 0.0); // white queen placed
         assert_eq!(hand.iter().sum::<f32>(), 22.0 - 4.0);
         let _ = nnue.evaluate(&board);
+    }
+
+    // The accumulators kept in the board must equal a from scratch evaluation after any
+    // sequence of moves and undos, queens moving included.
+    #[test]
+    fn incremental_accumulators_match_from_scratch() {
+        use minimax::{Game, Strategy};
+        let net = Arc::new(tiny_random());
+        let mut board = Board::from_game_type("Base+MLP").unwrap();
+        board.attach_nnue(net.clone());
+        let mut random = minimax::Random::<Rules>::new();
+        let mut history = Vec::new();
+        for ply in 0..120 {
+            if Rules::get_winner(&board).is_some() {
+                break;
+            }
+            let m = random.choose_move(&board).unwrap();
+            board.apply(m);
+            history.push(m);
+            let mut fresh = board.clone();
+            fresh.nnue = None;
+            assert_eq!(net.evaluate(&board), net.evaluate(&fresh), "ply {ply}");
+            // Undo and redo keep the accumulators in step as well.
+            if ply % 7 == 3 {
+                board.undo(m);
+                let mut fresh = board.clone();
+                fresh.nnue = None;
+                assert_eq!(net.evaluate(&board), net.evaluate(&fresh), "undo at ply {ply}");
+                board.apply(m);
+            }
+        }
+        assert!(history.len() > 20);
+    }
+
+    // Like tiny() but with varied weights, so mismatches cannot cancel out.
+    fn tiny_random() -> Nnue {
+        let (radius, hidden, l2) = (6u32, 8usize, 2usize);
+        let num_features = 127 * FEATURES_PER_CELL;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"TOCA");
+        for v in [1u32, radius, num_features as u32, hidden as u32, l2 as u32] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&400.0f32.to_le_bytes());
+        let sizes =
+            [num_features * hidden, hidden * 16, hidden, l2 * 2 * hidden, l2, l2 * l2, l2, l2, 1];
+        let mut state = 7u32;
+        for n in sizes {
+            for _ in 0..n {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let w = (state >> 8) as f32 / (1u32 << 24) as f32 * 0.4 - 0.2;
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        Nnue::parse(&buf).unwrap()
     }
 
     #[test]

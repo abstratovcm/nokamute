@@ -122,6 +122,8 @@ pub struct Board {
     pub(super) turn_history: Vec<Turn>,
 
     pub(super) game_type_bits: u8,
+    // Accumulators of the learned evaluation, kept in step with the pieces (see nnue.rs).
+    pub(crate) nnue: Option<Box<crate::NnueState>>,
 }
 
 impl Board {
@@ -200,10 +202,16 @@ impl Board {
         if bug == Bug::Queen {
             self.queens[color as usize] = hex;
         }
+        if self.nnue.is_some() {
+            self.nnue_on_insert(hex, bug, color);
+        }
     }
 
     // Asserts that there is something there.
     fn remove(&mut self, hex: Hex) -> (Bug, u8, Color) {
+        if self.nnue.is_some() {
+            self.nnue_on_remove(hex);
+        }
         let height = self.height(hex);
         let prev = self.node(hex);
 
@@ -317,6 +325,7 @@ impl Board {
             zobrist_history: Vec::new(),
             turn_history: Vec::new(),
             game_type_bits,
+            nnue: None,
         }
     }
 
@@ -351,6 +360,9 @@ impl Board {
                     Bug::initial_quantity()[bug as usize] - self.get_remaining()[bug as usize] + 1;
                 self.insert(hex, bug, bug_num, self.to_move());
                 self.mut_remaining()[bug as usize] -= 1;
+                if self.nnue.is_some() {
+                    self.nnue_on_hand(bug, self.to_move(), -1);
+                }
             }
             Turn::Move(start, end) => {
                 let (bug, bug_num, color) = self.remove(start);
@@ -375,6 +387,9 @@ impl Board {
             Turn::Place(hex, bug) => {
                 self.remove(hex);
                 self.mut_remaining()[bug as usize] += 1;
+                if self.nnue.is_some() {
+                    self.nnue_on_hand(bug, self.to_move(), 1);
+                }
             }
             Turn::Move(start, end) => {
                 let (bug, bug_num, color) = self.remove(end);

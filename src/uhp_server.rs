@@ -48,7 +48,11 @@ impl<W: Write> UhpServer<W> {
     fn new_game(&mut self, args: &str) -> Result<()> {
         self.pv_dirty = true;
         let args = if args.is_empty() { "Base" } else { args };
-        self.board = Some(Board::from_game_string(args)?);
+        let mut board = Board::from_game_string(args)?;
+        if let Eval::Nnue(e) = &self.config.eval {
+            board.attach_nnue(e.0.clone());
+        }
+        self.board = Some(board);
         self.reset_engine();
         writeln!(self.output, "{}", self.board.as_mut().unwrap().game_string())?;
         Ok(())

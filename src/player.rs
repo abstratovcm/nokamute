@@ -135,6 +135,8 @@ pub fn play_game(
 struct NokamutePlayer {
     board: Board,
     strategy: Box<dyn ScoredStrategy>,
+    // The learned evaluation, if any, so new boards carry its accumulators.
+    nnue: Option<std::sync::Arc<crate::Nnue>>,
     random_opening: bool,
     // Whether the last generate_move ran the strategy (false after a random opening move).
     searched: bool,
@@ -142,17 +144,27 @@ struct NokamutePlayer {
 }
 
 impl NokamutePlayer {
-    fn new(strategy: Box<dyn ScoredStrategy>, random_opening: bool) -> Self {
-        Self::new_with_name(&format!("nokamute {}", nokamute_version()), strategy, random_opening)
+    fn new(strategy: Box<dyn ScoredStrategy>, eval: &Eval, random_opening: bool) -> Self {
+        let name = format!("nokamute {}", nokamute_version());
+        Self::new_with_name(&name, strategy, eval, random_opening)
     }
 
     fn new_with_name(
-        name: &str, mut strategy: Box<dyn ScoredStrategy>, random_opening: bool,
+        name: &str, mut strategy: Box<dyn ScoredStrategy>, eval: &Eval, random_opening: bool,
     ) -> Self {
         strategy.set_timeout(Duration::from_secs(5));
+        let nnue = match eval {
+            Eval::Nnue(e) => Some(e.0.clone()),
+            Eval::Basic(_) => None,
+        };
+        let mut board = Board::default();
+        if let Some(net) = &nnue {
+            board.attach_nnue(net.clone());
+        }
         NokamutePlayer {
-            board: Board::default(),
+            board,
             strategy,
+            nnue,
             random_opening,
             searched: false,
             name: name.to_owned(),
@@ -167,6 +179,9 @@ impl Player for NokamutePlayer {
 
     fn new_game(&mut self, game_string: &str) {
         self.board = Board::from_game_string(game_string).unwrap();
+        if let Some(net) = &self.nnue {
+            self.board.attach_nnue(net.clone());
+        }
     }
 
     fn play_move(&mut self, m: Turn) {
@@ -363,6 +378,7 @@ impl PlayerConfig {
     pub(crate) fn new_player(&self) -> Box<dyn Player + Send> {
         Box::new(NokamutePlayer::new(
             Box::new(IterativeSearch::new(self.eval.clone(), self.opts)),
+            &self.eval,
             self.random_opening,
         ))
     }
@@ -373,6 +389,7 @@ impl PlayerConfig {
             PlayerStrategy::Random => NokamutePlayer::new_with_name(
                 "random",
                 Box::<Random<Rules>>::default(),
+                &self.eval,
                 self.random_opening,
             ),
             PlayerStrategy::Mcts(opts) => {
@@ -386,6 +403,7 @@ impl PlayerConfig {
                         opts,
                         Box::new(BiasedRollouts {}),
                     )),
+                    &self.eval,
                     self.random_opening,
                 )
             }
@@ -401,6 +419,7 @@ impl PlayerConfig {
                     } else {
                         Box::new(ParallelSearch::new(self.eval.clone(), self.opts, parallel_opts))
                     },
+                    &self.eval,
                     self.random_opening,
                 )
             }

@@ -60,4 +60,29 @@ fn main() {
     println!("nnue r1 h256 (in L2):  {}", easybench::bench(|| small.evaluate(&board)));
     let h128 = NnueEvaluator(Arc::new(synthetic_net(6, 128)));
     println!("nnue r6 h128:          {}", easybench::bench(|| h128.evaluate(&board)));
+    // With the accumulators kept in the board: only the small layers per evaluation.
+    let mut attached = board.clone();
+    attached.attach_nnue(nnue.0.clone());
+    println!("nnue r6 h256 incr:     {}", easybench::bench(|| nnue.evaluate(&attached)));
+    let mut attached128 = board.clone();
+    attached128.attach_nnue(h128.0.clone());
+    println!("nnue r6 h128 incr:     {}", easybench::bench(|| h128.evaluate(&attached128)));
+    // Cost of keeping them in step: one piece move (remove + insert) with and without.
+    let m = minimax::Random::<Rules>::new().choose_move(&attached).unwrap();
+    println!(
+        "apply+undo plain:      {}",
+        easybench::bench(|| {
+            let mut b = board.clone();
+            b.apply(m);
+            b.undo(m);
+        })
+    );
+    println!(
+        "apply+undo incr:       {}",
+        easybench::bench(|| {
+            let mut b = attached.clone();
+            b.apply(m);
+            b.undo(m);
+        })
+    );
 }
