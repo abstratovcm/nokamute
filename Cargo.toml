@@ -35,6 +35,10 @@ larger-grid = []
 name = "minimax"
 harness = false
 
+[[bench]]
+name = "nnue"
+harness = false
+
 # For wasm32 library builds.
 [lib]
 crate-type=["cdylib", "rlib"]

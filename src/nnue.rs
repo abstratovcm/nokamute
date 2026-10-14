@@ -17,8 +17,17 @@ use std::sync::Arc;
 
 const LEVELS: usize = 4;
 const FEATURES_PER_CELL: usize = 2 * 8 * LEVELS;
+const MAX_PIECES: usize = 28;
+const MAX_HIDDEN: usize = 512;
+const MAX_L2: usize = 64;
+// Pieces of one bug a side can hold in hand.
+const MAX_COUNT: usize = 3;
 // Keep the score clear of the win/loss values.
 const SCORE_LIMIT: f32 = 20000.0;
+// Quantization: accumulators and activations carry 127 per unit, layer weights 64 per unit.
+const ACT_SCALE: f64 = 127.0;
+const WEIGHT_SCALE: f64 = 64.0;
+const WEIGHT_SHIFT: u32 = 6;
 // tocandira's bug order, for the feature index and the pieces in hand vector.
 const BUG_ORDER: [Bug; 8] = [
     Bug::Queen,
@@ -43,15 +52,33 @@ pub struct Nnue {
     scale: f32,
     // (dq + radius) * (2 * radius + 1) + (dr + radius) -> cell index, same order as tocandira.
     cell_index: Vec<usize>,
-    ft: Vec<f32>,
-    hand_w: Vec<f32>,
-    hand_b: Vec<f32>,
-    l1_w: Vec<f32>,
-    l1_b: Vec<f32>,
-    l2_w: Vec<f32>,
-    l2_b: Vec<f32>,
+    // Feature table rows and biases in accumulator units (ACT_SCALE per unit).
+    ft: Vec<i16>,
+    // hand_w column times count, for each (slot, count): [16][MAX_COUNT + 1][hidden].
+    hand_rows: Vec<i16>,
+    hand_b: Vec<i16>,
+    // Layer weights in WEIGHT_SCALE units, biases in ACT_SCALE * WEIGHT_SCALE units.
+    l1_w: Vec<i8>,
+    l1_b: Vec<i32>,
+    l2_w: Vec<i8>,
+    l2_b: Vec<i32>,
     out_w: Vec<f32>,
     out_b: f32,
+}
+
+fn quantize_i16(values: &[f32], scale: f64) -> Vec<i16> {
+    values
+        .iter()
+        .map(|&v| round_half_even(v as f64 * scale).clamp(-32767.0, 32767.0) as i16)
+        .collect()
+}
+
+fn quantize_i8(values: &[f32], scale: f64) -> Vec<i8> {
+    values.iter().map(|&v| round_half_even(v as f64 * scale).clamp(-127.0, 127.0) as i8).collect()
+}
+
+fn quantize_i32(values: &[f32], scale: f64) -> Vec<i32> {
+    values.iter().map(|&v| round_half_even(v as f64 * scale) as i32).collect()
 }
 
 // Python's round(): halves go to the even neighbour.
@@ -119,8 +146,20 @@ impl Nnue {
             return Err(std::io::Error::other("nnue radius and feature count disagree"));
         }
 
+        if hidden > MAX_HIDDEN || l2 > MAX_L2 || !hidden.is_multiple_of(8) {
+            return Err(std::io::Error::other("unsupported nnue layer sizes"));
+        }
         let ft = read_f32s(buf, &mut pos, num_features * hidden)?;
         let hand_w = read_f32s(buf, &mut pos, hidden * 16)?;
+        let mut hand_rows = vec![0.0; 16 * (MAX_COUNT + 1) * hidden];
+        for slot in 0..16 {
+            for count in 0..=MAX_COUNT {
+                for i in 0..hidden {
+                    hand_rows[(slot * (MAX_COUNT + 1) + count) * hidden + i] =
+                        hand_w[i * 16 + slot] * count as f32;
+                }
+            }
+        }
         let hand_b = read_f32s(buf, &mut pos, hidden)?;
         let l1_w = read_f32s(buf, &mut pos, l2 * 2 * hidden)?;
         let l1_b = read_f32s(buf, &mut pos, l2)?;
@@ -138,13 +177,13 @@ impl Nnue {
             l2,
             scale,
             cell_index,
-            ft,
-            hand_w,
-            hand_b,
-            l1_w,
-            l1_b,
-            l2_w,
-            l2_b,
+            ft: quantize_i16(&ft, ACT_SCALE),
+            hand_rows: quantize_i16(&hand_rows, ACT_SCALE),
+            hand_b: quantize_i16(&hand_b, ACT_SCALE),
+            l1_w: quantize_i8(&l1_w, WEIGHT_SCALE),
+            l1_b: quantize_i32(&l1_b, ACT_SCALE * WEIGHT_SCALE),
+            l2_w: quantize_i8(&l2_w, WEIGHT_SCALE),
+            l2_b: quantize_i32(&l2_b, ACT_SCALE * WEIGHT_SCALE),
             out_w,
             out_b,
         })
@@ -203,20 +242,28 @@ impl Nnue {
 
     // Active features from `color`'s perspective, one per piece on the board.
     pub fn features(&self, board: &Board, color: Color) -> Vec<usize> {
+        let mut out = [0; MAX_PIECES];
+        let n = self.features_into(board, color, &mut out);
+        out[..n].to_vec()
+    }
+
+    fn features_into(&self, board: &Board, color: Color, out: &mut [usize; MAX_PIECES]) -> usize {
         let anchor = Nnue::anchor(board, color);
-        let mut out = Vec::with_capacity(28);
+        let mut n = 0;
         for &hex in board.occupied_hexes.iter().flatten() {
             let node = board.node(hex);
             let (dq, dr) = Nnue::offset(hex, anchor);
             let level = board.height(hex) - 1;
-            out.push(self.feature(dq, dr, node.color() != color, node.bug(), level));
+            out[n] = self.feature(dq, dr, node.color() != color, node.bug(), level);
+            n += 1;
         }
         for under in board.get_underworld() {
             let node = under.node();
             let (dq, dr) = Nnue::offset(under.hex(), anchor);
-            out.push(self.feature(dq, dr, node.color() != color, node.bug(), under.height() - 1));
+            out[n] = self.feature(dq, dr, node.color() != color, node.bug(), under.height() - 1);
+            n += 1;
         }
-        out
+        n
     }
 
     // Pieces in hand in tocandira's bug order, `color` first.
@@ -230,43 +277,127 @@ impl Nnue {
         hand
     }
 
-    fn accumulate(&self, features: &[usize], hand: &[f32; 16]) -> Vec<f32> {
-        let mut acc = self.hand_b.clone();
-        for (i, row) in self.hand_w.chunks_exact(16).enumerate() {
-            acc[i] += row.iter().zip(hand).map(|(w, h)| w * h).sum::<f32>();
+    // Accumulator of one perspective in ACT_SCALE units: bias, one table row per piece, and
+    // the pieces in hand as precomputed rows (hand_w column times count), clipped to [0, 127].
+    fn accumulate(&self, board: &Board, color: Color, act: &mut [u8; MAX_HIDDEN]) {
+        let h = self.hidden;
+        let mut acc = [0i16; MAX_HIDDEN];
+        acc[..h].copy_from_slice(&self.hand_b);
+        let mut feats = [0; MAX_PIECES];
+        let n = self.features_into(board, color, &mut feats);
+        for &f in &feats[..n] {
+            add_row(&mut acc[..h], &self.ft[f * h..(f + 1) * h]);
         }
-        for &f in features {
-            let row = &self.ft[f * self.hidden..(f + 1) * self.hidden];
-            for (a, w) in acc.iter_mut().zip(row) {
-                *a += w;
+        for (slot, c) in [color as usize, color.other()].into_iter().enumerate() {
+            for (j, bug) in BUG_ORDER.iter().enumerate() {
+                let count = (board.remaining[c][*bug as usize] as usize).min(MAX_COUNT);
+                let row = ((slot * 8 + j) * (MAX_COUNT + 1) + count) * h;
+                add_row(&mut acc[..h], &self.hand_rows[row..row + h]);
             }
         }
-        for a in acc.iter_mut() {
-            *a = a.clamp(0.0, 1.0);
+        for (a, v) in act[..h].iter_mut().zip(&acc[..h]) {
+            *a = (*v).clamp(0, ACT_SCALE as i16) as u8;
         }
-        acc
     }
 
     pub fn evaluate(&self, board: &Board) -> Evaluation {
         let me = board.to_move();
         let them = if me == Color::White { Color::Black } else { Color::White };
-        let hand_me = Nnue::hand(board, me);
-        let hand_them = Nnue::hand(board, them);
-        let own = self.accumulate(&self.features(board, me), &hand_me);
-        let opp = self.accumulate(&self.features(board, them), &hand_them);
-        let mut x = Vec::with_capacity(self.l2);
-        for (i, row) in self.l1_w.chunks_exact(2 * self.hidden).enumerate() {
-            let dot: f32 = row[..self.hidden].iter().zip(&own).map(|(w, a)| w * a).sum::<f32>()
-                + row[self.hidden..].iter().zip(&opp).map(|(w, a)| w * a).sum::<f32>();
-            x.push((dot + self.l1_b[i]).clamp(0.0, 1.0));
+        let h = self.hidden;
+        let mut own = [0u8; MAX_HIDDEN];
+        let mut opp = [0u8; MAX_HIDDEN];
+        self.accumulate(board, me, &mut own);
+        self.accumulate(board, them, &mut opp);
+        let mut x = [0u8; MAX_L2];
+        for (i, row) in self.l1_w.chunks_exact(2 * h).enumerate() {
+            let sum = dot(&own[..h], &row[..h]) + dot(&opp[..h], &row[h..]) + self.l1_b[i];
+            x[i] = (sum >> WEIGHT_SHIFT).clamp(0, ACT_SCALE as i32) as u8;
         }
-        let mut y = Vec::with_capacity(self.l2);
+        let mut y = [0u8; MAX_L2];
         for (i, row) in self.l2_w.chunks_exact(self.l2).enumerate() {
-            let dot: f32 = row.iter().zip(&x).map(|(w, a)| w * a).sum();
-            y.push((dot + self.l2_b[i]).clamp(0.0, 1.0));
+            let sum = dot(&x[..self.l2], row) + self.l2_b[i];
+            y[i] = (sum >> WEIGHT_SHIFT).clamp(0, ACT_SCALE as i32) as u8;
         }
-        let out: f32 = self.out_w.iter().zip(&y).map(|(w, a)| w * a).sum::<f32>() + self.out_b;
+        let out: f32 =
+            self.out_w.iter().zip(&y).map(|(w, &a)| w * a as f32 / ACT_SCALE as f32).sum::<f32>()
+                + self.out_b;
         (out * self.scale).clamp(-SCORE_LIMIT, SCORE_LIMIT).round() as Evaluation
+    }
+}
+
+fn add_row(acc: &mut [i16], row: &[i16]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature was detected at runtime.
+        return unsafe { avx2::add_row(acc, row) };
+    }
+    for (a, w) in acc.iter_mut().zip(row) {
+        *a = a.saturating_add(*w);
+    }
+}
+
+// Activations (0..127) against int8 weights, summed in int32.
+fn dot(act: &[u8], w: &[i8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature was detected at runtime.
+        return unsafe { avx2::dot(act, w) };
+    }
+    dot_scalar(act, w)
+}
+
+fn dot_scalar(act: &[u8], w: &[i8]) -> i32 {
+    let mut lanes = [0i32; 8];
+    let mut ca = act.chunks_exact(8);
+    let mut cw = w.chunks_exact(8);
+    for (x, y) in (&mut ca).zip(&mut cw) {
+        for k in 0..8 {
+            lanes[k] += x[k] as i32 * y[k] as i32;
+        }
+    }
+    let tail: i32 =
+        ca.remainder().iter().zip(cw.remainder()).map(|(x, y)| *x as i32 * *y as i32).sum();
+    lanes.iter().sum::<i32>() + tail
+}
+
+// The same two loops with AVX2: 16 lane int16 adds, and the u8 x i8 multiply-add pairs that
+// NNUE inference is built around.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn add_row(acc: &mut [i16], row: &[i16]) {
+        let n = acc.len().min(row.len()) / 16 * 16;
+        for i in (0..n).step_by(16) {
+            let a = _mm256_loadu_si256(acc.as_ptr().add(i) as *const __m256i);
+            let r = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+            _mm256_storeu_si256(acc.as_mut_ptr().add(i) as *mut __m256i, _mm256_adds_epi16(a, r));
+        }
+        for i in n..acc.len().min(row.len()) {
+            acc[i] = acc[i].saturating_add(row[i]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn dot(act: &[u8], w: &[i8]) -> i32 {
+        let len = act.len().min(w.len());
+        let n = len / 32 * 32;
+        let ones = _mm256_set1_epi16(1);
+        let mut sum = _mm256_setzero_si256();
+        for i in (0..n).step_by(32) {
+            let a = _mm256_loadu_si256(act.as_ptr().add(i) as *const __m256i);
+            let b = _mm256_loadu_si256(w.as_ptr().add(i) as *const __m256i);
+            // Pairs of u8 * i8 products summed into i16 (127 * 127 * 2 fits), then into i32.
+            sum = _mm256_add_epi32(sum, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        }
+        let halves = _mm_add_epi32(_mm256_castsi256_si128(sum), _mm256_extracti128_si256(sum, 1));
+        let quads = _mm_add_epi32(halves, _mm_srli_si128(halves, 8));
+        let mut total = _mm_cvtsi128_si32(_mm_add_epi32(quads, _mm_srli_si128(quads, 4)));
+        for i in n..len {
+            total += act[i] as i32 * w[i] as i32;
+        }
+        total
     }
 }
 
@@ -291,7 +422,7 @@ mod tests {
 
     // A radius 6, hidden 4, l2 2 net with all weights set to a constant.
     fn tiny() -> Nnue {
-        let (radius, hidden, l2) = (6u32, 4usize, 2usize);
+        let (radius, hidden, l2) = (6u32, 8usize, 2usize);
         let num_features = 127 * FEATURES_PER_CELL;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"TOCA");
