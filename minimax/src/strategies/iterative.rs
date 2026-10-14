@@ -12,7 +12,6 @@ use super::sync_util::timeout_signal;
 use super::table::*;
 
 use instant::Instant;
-use rand::prelude::SliceRandom;
 use std::cmp::max;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -634,6 +633,19 @@ where
     }
 }
 
+// Fisher-Yates driven by splitmix64: stable across platforms and rand versions.
+fn shuffle_seeded<T>(items: &mut [T], seed: u64) {
+    let mut state = seed;
+    for i in (1..items.len()).rev() {
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^= z >> 31;
+        items.swap(i, (z % (i as u64 + 1)) as usize);
+    }
+}
+
 impl<E: Evaluator> Strategy<E::G> for IterativeSearch<E>
 where
     <E::G as Game>::S: Clone,
@@ -659,8 +671,9 @@ where
         if E::G::generate_moves(&s_clone, &mut moves).is_some() {
             return None;
         }
-        // Start in a random order.
-        moves.shuffle(&mut rand::rng());
+        // Start in a random looking order seeded by the position, so the same position
+        // always gets the same search (and score) whatever was searched before.
+        shuffle_seeded(&mut moves, root_hash);
         let mut moves = moves.into_iter().map(|m| ValueMove::new(0, m)).collect::<Vec<_>>();
 
         // Start at 1 or 2 to hit the max depth.

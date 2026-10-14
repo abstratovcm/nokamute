@@ -597,6 +597,27 @@ mod tests {
     }
 
     #[test]
+    fn search_is_a_function_of_the_position() {
+        // The root move order is seeded by the position: fresh engines, and one that searched
+        // something else first, agree on the move, score and pv. With an unseeded order this
+        // self play position gave several different results at depth 3.
+        let position = r"newgame Base+MLP;InProgress;White[15];wP;bS1 wP-;wB1 /wP;bP bS1\;wQ \wP;bQ bP-;wA1 /wQ;bA1 bS1/;wL /wA1;bA2 bA1\;wA1 bA2/;bA1 -wQ;wL \bS1;bM bP\;wB1 bA1\;bA3 \bA1;wB1 bA1;bA3 /bP;wA2 \wB1;bM \wA2;wL bP\;bA3 wQ/;wA3 /wL;bQ wP\;wB2 wL-;bM wB2/;bQ wB1\;bG1 /bQ";
+        let mut outs = Vec::new();
+        for _ in 0..8 {
+            let mut server = test_server();
+            command(&mut server, position);
+            outs.push(command(&mut server, "search depth 3"));
+        }
+        let mut server = test_server();
+        command(&mut server, "newgame Base");
+        command(&mut server, "search depth 3");
+        command(&mut server, position);
+        outs.push(command(&mut server, "search depth 3"));
+        assert!(!outs[0].contains("err"), "{outs:?}");
+        assert!(outs.iter().all(|out| out == &outs[0]), "{outs:?}");
+    }
+
+    #[test]
     fn eval_reports_static_score() {
         let mut server = test_server();
         assert!(command(&mut server, "eval").contains("err"));
