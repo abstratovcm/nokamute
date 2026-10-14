@@ -263,34 +263,83 @@ impl Evaluator for BasicEvaluator {
     // it will be useful. Thus, each player can get a bonus move to move a
     // piece that they have just placed (but not other pieces).
     fn generate_noisy_moves(&self, board: &Board, moves: &mut Vec<Turn>) {
-        if board.turn_history.len() < 4 || board.get_remaining()[Bug::Queen as usize] == 0 {
-            // Wait until movements are at least possible.
+        noisy_moves(board, moves);
+    }
+}
+
+// The quiescence hook above, shared with the learned evaluator.
+pub(crate) fn noisy_moves(board: &Board, moves: &mut Vec<Turn>) {
+    if board.turn_history.len() < 4 || board.get_remaining()[Bug::Queen as usize] == 0 {
+        // Wait until movements are at least possible.
+        return;
+    }
+    let enemy_last_move = board.turn_history[board.turn_history.len() - 1];
+    let my_last_move = board.turn_history[board.turn_history.len() - 2];
+
+    if let Turn::Place(hex, _) = my_last_move {
+        // Drop attack is quiet enough.
+        if !adjacent(board.queens[board.to_move().other()]).contains(&hex) {
+            // TODO: just generate from this spot (ignoring throws?).
+            board.generate_movements(moves);
+            moves.retain(|m| if let Turn::Move(start, _) = *m { start == hex } else { false });
+            // If the piece became pinned or covered, this will return no
+            // moves, which means the search will terminate.
             return;
         }
-        let enemy_last_move = board.turn_history[board.turn_history.len() - 1];
-        let my_last_move = board.turn_history[board.turn_history.len() - 2];
+    }
 
-        if let Turn::Place(hex, _) = my_last_move {
-            // Drop attack is quiet enough.
-            if !adjacent(board.queens[board.to_move().other()]).contains(&hex) {
-                // TODO: just generate from this spot (ignoring throws?).
-                board.generate_movements(moves);
-                moves.retain(|m| if let Turn::Move(start, _) = *m { start == hex } else { false });
-                // If the piece became pinned or covered, this will return no
-                // moves, which means the search will terminate.
-                return;
-            }
+    if let Turn::Place(hex, _) = enemy_last_move {
+        if !adjacent(board.queens[board.to_move() as usize]).contains(&hex) {
+            // We didn't just place, but opponent did. Do some movement to
+            // give them a chance to quiesce.
+            board.generate_movements(moves);
         }
+    }
 
-        if let Turn::Place(hex, _) = enemy_last_move {
-            if !adjacent(board.queens[board.to_move() as usize]).contains(&hex) {
-                // We didn't just place, but opponent did. Do some movement to
-                // give them a chance to quiesce.
-                board.generate_movements(moves);
-            }
+    // If no one just placed something, return nothing and stop the search.
+}
+
+// Either evaluator behind one type, so the search and the UHP server don't care which.
+#[derive(Clone)]
+pub enum Eval {
+    Basic(BasicEvaluator),
+    Nnue(crate::NnueEvaluator),
+}
+
+impl Default for Eval {
+    fn default() -> Self {
+        Eval::Basic(BasicEvaluator::default())
+    }
+}
+
+impl Eval {
+    pub(crate) fn aggression(&self) -> u8 {
+        match self {
+            Eval::Basic(e) => e.aggression(),
+            Eval::Nnue(_) => 3,
         }
+    }
 
-        // If no one just placed something, return nothing and stop the search.
+    // Only the basic evaluator has the dial; the learned one ignores it.
+    pub(crate) fn set_aggression(&mut self, aggression: u8) {
+        if let Eval::Basic(_) = self {
+            *self = Eval::Basic(BasicEvaluator::new(aggression));
+        }
+    }
+}
+
+impl Evaluator for Eval {
+    type G = Rules;
+
+    fn evaluate(&self, board: &Board) -> Evaluation {
+        match self {
+            Eval::Basic(e) => e.evaluate(board),
+            Eval::Nnue(e) => e.evaluate(board),
+        }
+    }
+
+    fn generate_noisy_moves(&self, board: &Board, moves: &mut Vec<Turn>) {
+        noisy_moves(board, moves);
     }
 }
 

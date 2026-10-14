@@ -28,7 +28,8 @@ engine flags:
  --aspiration-window=[int]
  --double-step
  --quiet-search
- --null-move-pruning"#,
+ --null-move-pruning
+ --nnue=[path]"#,
         nokamute_version()
     );
 }

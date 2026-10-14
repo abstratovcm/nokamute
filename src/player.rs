@@ -6,7 +6,9 @@ use crate::cli::CliPlayer;
 use crate::mcts::BiasedRollouts;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::uhp_client::UhpPlayer;
-use crate::{nokamute_version, BasicEvaluator, Board, Bug, Rules, Turn};
+use crate::{nokamute_version, Board, Bug, Eval, Rules, Turn};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{Nnue, NnueEvaluator};
 use minimax::*;
 use std::time::Duration;
 
@@ -36,14 +38,14 @@ pub(crate) trait ScoredStrategy: Strategy<Rules> + Send {
     }
 }
 
-impl ScoredStrategy for IterativeSearch<BasicEvaluator> {
+impl ScoredStrategy for IterativeSearch<Eval> {
     fn root_value(&self) -> Option<Evaluation> {
         Some(IterativeSearch::root_value(self))
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl ScoredStrategy for ParallelSearch<BasicEvaluator> {
+impl ScoredStrategy for ParallelSearch<Eval> {
     fn root_value(&self) -> Option<Evaluation> {
         Some(ParallelSearch::root_value(self))
     }
@@ -252,7 +254,7 @@ pub struct PlayerConfig {
     pub(crate) opts: IterativeOptions,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) strategy: PlayerStrategy,
-    pub(crate) eval: BasicEvaluator,
+    pub(crate) eval: Eval,
     pub(crate) random_opening: bool,
 }
 
@@ -282,6 +284,14 @@ pub fn configure_player() -> Result<(PlayerConfig, Vec<String>), pico_args::Erro
     }
     if args.contains("--quiet-search") {
         config.opts = config.opts.with_quiescence_search_depth(2);
+    }
+    // Learned evaluation from a tocandira weights file.
+    let nnue: Option<String> = args.opt_value_from_str("--nnue")?;
+    if let Some(path) = nnue {
+        match Nnue::load(&path) {
+            Ok(nnue) => config.eval = Eval::Nnue(NnueEvaluator(std::sync::Arc::new(nnue))),
+            Err(err) => exit(format!("could not load nnue weights {path}: {err}")),
+        }
     }
 
     // 0 for num_cpu threads; >0 for specific count.
@@ -340,7 +350,7 @@ impl PlayerConfig {
                 .with_table_byte_size(100 << 20),
             #[cfg(not(target_arch = "wasm32"))]
             strategy: PlayerStrategy::Iterative(ParallelOptions::new()),
-            eval: BasicEvaluator::default(),
+            eval: Eval::default(),
             random_opening: false,
         }
     }
@@ -352,7 +362,7 @@ impl PlayerConfig {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn new_player(&self) -> Box<dyn Player + Send> {
         Box::new(NokamutePlayer::new(
-            Box::new(IterativeSearch::new(self.eval, self.opts)),
+            Box::new(IterativeSearch::new(self.eval.clone(), self.opts)),
             self.random_opening,
         ))
     }
@@ -387,9 +397,9 @@ impl PlayerConfig {
                 }
                 NokamutePlayer::new(
                     if num_threads == 1 {
-                        Box::new(IterativeSearch::new(self.eval, self.opts))
+                        Box::new(IterativeSearch::new(self.eval.clone(), self.opts))
                     } else {
-                        Box::new(ParallelSearch::new(self.eval, self.opts, parallel_opts))
+                        Box::new(ParallelSearch::new(self.eval.clone(), self.opts, parallel_opts))
                     },
                     self.random_opening,
                 )

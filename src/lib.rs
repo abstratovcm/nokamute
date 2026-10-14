@@ -12,6 +12,8 @@ mod hex_grid;
 pub use hex_grid::*;
 #[cfg(not(target_arch = "wasm32"))]
 mod mcts;
+mod nnue;
+pub use nnue::*;
 mod notation;
 pub use notation::*;
 #[cfg(not(target_arch = "wasm32"))]

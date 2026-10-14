@@ -142,6 +142,29 @@ impl<W: Write> UhpServer<W> {
         Ok(())
     }
 
+    // Unofficial command: the learned evaluation's active features as `own;opp;hand`.
+    fn features(&mut self) -> Result<()> {
+        let board = self.board.as_ref().ok_or(UhpError::GameNotStarted)?;
+        let Eval::Nnue(nnue) = &self.config.eval else {
+            return Err(UhpError::EngineError("features needs --nnue".to_string()));
+        };
+        let me = board.to_move();
+        let them = if me == Color::White { Color::Black } else { Color::White };
+        let list = |mut v: Vec<usize>| {
+            v.sort_unstable();
+            v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+        };
+        let hand = Nnue::hand(board, me).iter().map(|h| (*h as u8).to_string()).collect::<Vec<_>>();
+        writeln!(
+            self.output,
+            "{};{};{}",
+            list(nnue.0.features(board, me)),
+            list(nnue.0.features(board, them)),
+            hand.join(",")
+        )?;
+        Ok(())
+    }
+
     fn pv(&mut self) -> Result<()> {
         let pv = self.engine.as_ref().ok_or(UhpError::GameNotStarted)?.principal_variation();
         let board = self.board.as_mut().unwrap();
@@ -297,6 +320,7 @@ impl<W: Write> UhpServer<W> {
             "bestmove" => self.best_move(args),
             "search" => self.search(args),
             "eval" => self.eval(),
+            "features" => self.features(),
             "pv" => self.pv(),
             "undo" => self.undo(args),
             "options" => self.options(args),
@@ -385,7 +409,7 @@ impl UhpOptionInt for AggressionOption {
         5
     }
     fn set(value: usize, config: &mut PlayerConfig) {
-        config.eval = BasicEvaluator::new(value as u8);
+        config.eval.set_aggression(value as u8);
     }
 }
 

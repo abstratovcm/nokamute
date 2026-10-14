@@ -97,6 +97,9 @@ impl UnderNode {
     pub fn hex(&self) -> Hex {
         self.hex
     }
+    pub fn height(&self) -> u8 {
+        self.height
+    }
 }
 
 #[derive(Clone)]
@@ -238,7 +241,7 @@ impl Board {
         }
     }
 
-    fn height(&self, hex: Hex) -> u8 {
+    pub(crate) fn height(&self, hex: Hex) -> u8 {
         self.underworld_height(hex, self.node(hex))
     }
 
