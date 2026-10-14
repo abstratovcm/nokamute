@@ -2,7 +2,7 @@ extern crate minimax;
 
 use crate::notation::{Result, UhpError};
 use crate::*;
-use minimax::Game;
+use minimax::{Evaluator, Game};
 
 use std::io::Write;
 #[cfg(not(target_arch = "wasm32"))]
@@ -132,6 +132,13 @@ impl<W: Write> UhpServer<W> {
         let pvlen = engine.principal_variation().len();
         let board = self.board.as_ref().unwrap();
         writeln!(self.output, "{};{};{}", board.to_move_string(m), score, pvlen)?;
+        Ok(())
+    }
+
+    // Unofficial command: static evaluation of the current position, side to move's perspective.
+    fn eval(&mut self) -> Result<()> {
+        let board = self.board.as_ref().ok_or(UhpError::GameNotStarted)?;
+        writeln!(self.output, "{}", self.config.eval.evaluate(board))?;
         Ok(())
     }
 
@@ -289,6 +296,7 @@ impl<W: Write> UhpServer<W> {
             "pass" => self.play("pass"),
             "bestmove" => self.best_move(args),
             "search" => self.search(args),
+            "eval" => self.eval(),
             "pv" => self.pv(),
             "undo" => self.undo(args),
             "options" => self.options(args),
@@ -558,5 +566,16 @@ mod tests {
         command(&mut server, "newgame Base");
         let out = command(&mut server, "search depth 1");
         assert_eq!(out.split(';').nth(1), Some(""), "{out}");
+    }
+
+    #[test]
+    fn eval_reports_static_score() {
+        let mut server = test_server();
+        assert!(command(&mut server, "eval").contains("err"));
+        command(&mut server, "newgame Base");
+        assert_eq!(command(&mut server, "eval"), "0");
+        command(&mut server, "play wA1");
+        command(&mut server, "play bQ wA1-");
+        command(&mut server, "eval").parse::<i32>().unwrap();
     }
 }
