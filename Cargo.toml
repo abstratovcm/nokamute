@@ -19,6 +19,10 @@ pico-args = "0.4"
 [target.'cfg(target_arch="wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 
+# minimax 0.6.0 (MIT, by the same author), vendored so the search can change.
+[patch.crates-io]
+minimax = { path = "minimax" }
+
 [dev-dependencies]
 easybench = "1.1.0"
 
