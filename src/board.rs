@@ -129,6 +129,12 @@ pub struct Board {
 }
 
 impl Board {
+    // Hash of the pieces (hex, bug, colour, height) and the side to move: what an evaluation
+    // depends on (the pieces in hand follow from the pieces on the board).
+    pub(crate) fn position_hash(&self) -> u64 {
+        self.zobrist_hash
+    }
+
     pub fn to_move(&self) -> Color {
         if self.turn_num.is_multiple_of(2) {
             Color::White

@@ -52,6 +52,8 @@ fn bug_index(bug: Bug) -> usize {
 }
 
 pub struct Nnue {
+    // Tells nets apart in the evaluation cache.
+    id: u32,
     radius: i32,
     pub num_features: usize,
     hidden: usize,
@@ -193,7 +195,9 @@ impl Nnue {
         }
         let l1_stride = padded(2 * hidden + scalars);
         let l2_stride = padded(l2);
+        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         let mut net = Nnue {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             radius,
             num_features,
             hidden,
@@ -742,11 +746,42 @@ mod avx2 {
 #[derive(Clone)]
 pub struct NnueEvaluator(pub Arc<Nnue>);
 
+// Leaf evaluations repeat within a search (a null window probe that fails is searched again,
+// and move orders transpose): about a quarter of them on mid game positions. An evaluation
+// is a function of the position, so a per thread table keyed by the position's hash returns
+// the same score without computing it again.
+const CACHE_BITS: u32 = 18;
+
+#[derive(Clone, Copy, Default)]
+struct CacheEntry {
+    hash: u64,
+    net: u32,
+    value: Evaluation,
+}
+
+thread_local! {
+    static CACHE: std::cell::RefCell<Vec<CacheEntry>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Evaluator for NnueEvaluator {
     type G = Rules;
 
     fn evaluate(&self, board: &Board) -> Evaluation {
-        self.0.evaluate(board)
+        let hash = board.position_hash();
+        let net = self.0.id;
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.is_empty() {
+                cache.resize(1 << CACHE_BITS, CacheEntry::default());
+            }
+            let slot = &mut cache[(hash >> (64 - CACHE_BITS)) as usize];
+            if slot.hash == hash && slot.net == net {
+                return slot.value;
+            }
+            let value = self.0.evaluate(board);
+            *slot = CacheEntry { hash, net, value };
+            value
+        })
     }
 
     fn generate_noisy_moves(&self, board: &Board, moves: &mut Vec<Turn>) {
@@ -835,6 +870,32 @@ mod tests {
             }
         }
         assert!(history.len() > 20);
+    }
+
+    // The cached evaluator returns what the net computes, for two nets interleaved on the
+    // same positions (the cache must tell them apart) and for positions met again.
+    #[test]
+    fn evaluation_cache_returns_the_net_value() {
+        use minimax::{Game, Strategy};
+        let (a, b) = (Arc::new(tiny_random(0)), Arc::new(tiny_random_with(NUM_SCALARS, 32, 8)));
+        let (ea, eb) = (NnueEvaluator(a.clone()), NnueEvaluator(b.clone()));
+        let mut board = Board::from_game_type("Base+MLP").unwrap();
+        let mut random = minimax::Random::<Rules>::new();
+        for _ in 0..80 {
+            if Rules::get_winner(&board).is_some() {
+                break;
+            }
+            let m = random.choose_move(&board).unwrap();
+            for _ in 0..2 {
+                board.apply(m);
+                assert_eq!(ea.evaluate(&board), a.evaluate(&board));
+                assert_eq!(eb.evaluate(&board), b.evaluate(&board));
+                board.undo(m);
+                assert_eq!(eb.evaluate(&board), b.evaluate(&board));
+                assert_eq!(ea.evaluate(&board), a.evaluate(&board));
+            }
+            board.apply(m);
+        }
     }
 
     #[test]
