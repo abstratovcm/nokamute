@@ -3,23 +3,40 @@ extern crate minimax;
 extern crate nokamute;
 
 use minimax::{Evaluator, Game, Strategy};
-use nokamute::{BasicEvaluator, Board, Nnue, NnueEvaluator, Rules};
+use nokamute::{scalars, BasicEvaluator, Board, Nnue, NnueEvaluator, Rules, NUM_SCALARS};
 use std::sync::Arc;
 
 // A radius 6, hidden 256, l2 32 net with pseudo random weights (the real file is not needed
 // to time the forward pass).
 fn synthetic_net(radius: u32, hidden: usize) -> Nnue {
+    synthetic_net_with(radius, hidden, 0)
+}
+
+fn synthetic_net_with(radius: u32, hidden: usize, scalars: usize) -> Nnue {
     let l2 = 32usize;
     let cells = (3 * radius * radius + 3 * radius + 1) as usize;
     let num_features = cells * 64;
     let mut buf = Vec::new();
     buf.extend_from_slice(b"TOCA");
-    for v in [1u32, radius, num_features as u32, hidden as u32, l2 as u32] {
+    let version = if scalars > 0 { 2u32 } else { 1 };
+    for v in [version, radius, num_features as u32, hidden as u32, l2 as u32] {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     buf.extend_from_slice(&400.0f32.to_le_bytes());
-    let sizes =
-        [num_features * hidden, hidden * 16, hidden, l2 * 2 * hidden, l2, l2 * l2, l2, l2, 1];
+    if scalars > 0 {
+        buf.extend_from_slice(&(scalars as u32).to_le_bytes());
+    }
+    let sizes = [
+        num_features * hidden,
+        hidden * 16,
+        hidden,
+        l2 * (2 * hidden + scalars),
+        l2,
+        l2 * l2,
+        l2,
+        l2,
+        1,
+    ];
     let mut state = 12345u32;
     for n in sizes {
         for _ in 0..n {
@@ -67,6 +84,16 @@ fn main() {
     let mut attached128 = board.clone();
     attached128.attach_nnue(h128.0.clone());
     println!("nnue r6 h128 incr:     {}", easybench::bench(|| h128.evaluate(&attached128)));
+    // The strategy scalars alone, and a net that feeds them to its first layer.
+    println!("scalars:               {}", easybench::bench(|| scalars(&board)));
+    let with = NnueEvaluator(Arc::new(synthetic_net_with(6, 256, NUM_SCALARS)));
+    let mut attached_with = board.clone();
+    attached_with.attach_nnue(with.0.clone());
+    println!("nnue r6 h256 incr+s:   {}", easybench::bench(|| with.evaluate(&attached_with)));
+    let with128 = NnueEvaluator(Arc::new(synthetic_net_with(6, 128, NUM_SCALARS)));
+    let mut attached_with128 = board.clone();
+    attached_with128.attach_nnue(with128.0.clone());
+    println!("nnue r6 h128 incr+s:   {}", easybench::bench(|| with128.evaluate(&attached_with128)));
     // Cost of keeping them in step: one piece move (remove + insert) with and without.
     let m = minimax::Random::<Rules>::new().choose_move(&attached).unwrap();
     println!(

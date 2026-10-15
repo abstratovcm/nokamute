@@ -22,6 +22,8 @@ mod perft;
 pub use perft::*;
 mod player;
 pub use player::*;
+mod scalars;
+pub use scalars::*;
 #[cfg(not(target_arch = "wasm32"))]
 mod uhp_client;
 mod uhp_server;

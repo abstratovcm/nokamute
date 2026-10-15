@@ -5,13 +5,17 @@
 // with cell the hex offset within `radius` of the anchor, bug in tocandira's order
 // (Q A B G S M L P) and level the stack height bucket 0, 1, 2, 3+. Both perspectives are
 // accumulated (sum of embedding rows plus a projection of the pieces in hand), clipped to
-// [0, 1], then two small layers give a score in the same units as BasicEvaluator.
+// [0, 1], then two small layers give a score in the same units as BasicEvaluator. A version 2
+// net also feeds the strategy scalars (scalars.rs) to the first layer, after both
+// accumulators.
 //
 // Weights come from `hive-export`: "TOCA", u32 version, radius, num_features, hidden, l2,
-// f32 scale, then little endian f32 arrays ft, hand_w, hand_b, l1_w, l1_b, l2_w, l2_b,
-// out_w, out_b.
+// f32 scale, (version 2: u32 number of scalars, 0 or NUM_SCALARS), then little endian f32
+// arrays ft, hand_w, hand_b, l1_w, l1_b, l2_w, l2_b, out_w, out_b. l1_w rows are the own
+// accumulator, the opponent's, then the scalars.
 
-use crate::{Board, Bug, Color, Hex, Rules, Turn, ROW_SIZE, START_HEX};
+use crate::{scalar_input, scalars, Board, Bug, Color, Hex, Rules, Turn, NUM_SCALARS, ROW_SIZE};
+use crate::{SCALAR_MAX, START_HEX};
 use minimax::{Evaluation, Evaluator};
 use std::sync::Arc;
 
@@ -50,6 +54,8 @@ pub struct Nnue {
     hidden: usize,
     l2: usize,
     scale: f32,
+    // Strategy scalars fed to the first layer: 0 or NUM_SCALARS.
+    scalars: usize,
     // (dq + radius) * (2 * radius + 1) + (dr + radius) -> cell index, same order as tocandira.
     cell_index: Vec<usize>,
     // Feature table rows and biases in accumulator units (ACT_SCALE per unit).
@@ -122,7 +128,7 @@ impl Nnue {
         }
         let mut pos = 4;
         let version = read_u32(buf, &mut pos)?;
-        if version != 1 {
+        if version != 1 && version != 2 {
             return Err(std::io::Error::other(format!("unsupported nnue version {version}")));
         }
         let radius = read_u32(buf, &mut pos)? as i32;
@@ -130,6 +136,10 @@ impl Nnue {
         let hidden = read_u32(buf, &mut pos)? as usize;
         let l2 = read_u32(buf, &mut pos)? as usize;
         let scale = f32::from_bits(read_u32(buf, &mut pos)?);
+        let scalars = if version == 2 { read_u32(buf, &mut pos)? as usize } else { 0 };
+        if scalars != 0 && scalars != NUM_SCALARS {
+            return Err(std::io::Error::other(format!("unsupported number of scalars {scalars}")));
+        }
 
         let width = (2 * radius + 1) as usize;
         let mut cell_index = vec![usize::MAX; width * width];
@@ -161,7 +171,7 @@ impl Nnue {
             }
         }
         let hand_b = read_f32s(buf, &mut pos, hidden)?;
-        let l1_w = read_f32s(buf, &mut pos, l2 * 2 * hidden)?;
+        let l1_w = read_f32s(buf, &mut pos, l2 * (2 * hidden + scalars))?;
         let l1_b = read_f32s(buf, &mut pos, l2)?;
         let l2_w = read_f32s(buf, &mut pos, l2 * l2)?;
         let l2_b = read_f32s(buf, &mut pos, l2)?;
@@ -176,6 +186,7 @@ impl Nnue {
             hidden,
             l2,
             scale,
+            scalars,
             cell_index,
             ft: quantize_i16(&ft, ACT_SCALE),
             hand_rows: quantize_i16(&hand_rows, ACT_SCALE),
@@ -324,9 +335,19 @@ impl Nnue {
                 self.activations(board, them, &mut opp);
             }
         }
+        let mut inputs = [0u8; NUM_SCALARS];
+        if self.scalars > 0 {
+            for (i, v) in scalars(board).into_iter().enumerate() {
+                inputs[i] = scalar_input(v, SCALAR_MAX[i]);
+            }
+        }
+        let s = self.scalars;
         let mut x = [0u8; MAX_L2];
-        for (i, row) in self.l1_w.chunks_exact(2 * h).enumerate() {
-            let sum = dot(&own[..h], &row[..h]) + dot(&opp[..h], &row[h..]) + self.l1_b[i];
+        for (i, row) in self.l1_w.chunks_exact(2 * h + s).enumerate() {
+            let sum = dot(&own[..h], &row[..h])
+                + dot(&opp[..h], &row[h..2 * h])
+                + dot(&inputs[..s], &row[2 * h..])
+                + self.l1_b[i];
             x[i] = (sum >> WEIGHT_SHIFT).clamp(0, ACT_SCALE as i32) as u8;
         }
         let mut y = [0u8; MAX_L2];
@@ -594,8 +615,13 @@ mod tests {
     // sequence of moves and undos, queens moving included.
     #[test]
     fn incremental_accumulators_match_from_scratch() {
+        incremental_matches_from_scratch(tiny_random(0));
+        incremental_matches_from_scratch(tiny_random(NUM_SCALARS));
+    }
+
+    fn incremental_matches_from_scratch(net: Nnue) {
         use minimax::{Game, Strategy};
-        let net = Arc::new(tiny_random());
+        let net = Arc::new(net);
         let mut board = Board::from_game_type("Base+MLP").unwrap();
         board.attach_nnue(net.clone());
         let mut random = minimax::Random::<Rules>::new();
@@ -622,18 +648,32 @@ mod tests {
         assert!(history.len() > 20);
     }
 
-    // Like tiny() but with varied weights, so mismatches cannot cancel out.
-    fn tiny_random() -> Nnue {
+    // Like tiny() but with varied weights, so mismatches cannot cancel out; with scalars, a
+    // version 2 file.
+    fn tiny_random(scalars: usize) -> Nnue {
         let (radius, hidden, l2) = (6u32, 8usize, 2usize);
         let num_features = 127 * FEATURES_PER_CELL;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"TOCA");
-        for v in [1u32, radius, num_features as u32, hidden as u32, l2 as u32] {
+        let version = if scalars > 0 { 2u32 } else { 1 };
+        for v in [version, radius, num_features as u32, hidden as u32, l2 as u32] {
             buf.extend_from_slice(&v.to_le_bytes());
         }
         buf.extend_from_slice(&400.0f32.to_le_bytes());
-        let sizes =
-            [num_features * hidden, hidden * 16, hidden, l2 * 2 * hidden, l2, l2 * l2, l2, l2, 1];
+        if scalars > 0 {
+            buf.extend_from_slice(&(scalars as u32).to_le_bytes());
+        }
+        let sizes = [
+            num_features * hidden,
+            hidden * 16,
+            hidden,
+            l2 * (2 * hidden + scalars),
+            l2,
+            l2 * l2,
+            l2,
+            l2,
+            1,
+        ];
         let mut state = 7u32;
         for n in sizes {
             for _ in 0..n {

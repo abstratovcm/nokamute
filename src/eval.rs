@@ -86,6 +86,19 @@ fn placeable(board: &Board, hex: Hex, color: Color) -> bool {
     !adjacent(hex).iter().any(|&adj| board.occupied(adj) && board.node(adj).color() != color)
 }
 
+// Whether the top bug at hex moves by crawling, so that a gate can block it. A mosquito
+// crawls when stacked or when every bug it touches crawls.
+pub(crate) fn crawls(board: &Board, hex: Hex) -> bool {
+    let node = board.node(hex);
+    if node.bug() != Bug::Mosquito {
+        return node.bug().crawler();
+    }
+    node.is_stacked()
+        || adjacent(hex)
+            .into_iter()
+            .all(|adj| !board.occupied(adj) || board.node(adj).bug().crawler())
+}
+
 #[test]
 fn test_placeable() {
     let b = Board::from_game_string("Base;;;wA1;bA1 wA1-;wA2 /wA1").unwrap();
@@ -121,11 +134,9 @@ impl Evaluator for BasicEvaluator {
             let node = board.node(hex);
             let mut bug_score = self.value(node.bug());
             let mut pillbug_powers = node.bug() == Bug::Pillbug;
-            let mut crawler = node.bug().crawler();
             if node.bug() == Bug::Mosquito {
                 // Mosquitos are valued as they can currently move.
                 bug_score = 0;
-                crawler = true;
                 if node.is_stacked() {
                     bug_score = self.value(Bug::Beetle);
                 } else {
@@ -138,15 +149,12 @@ impl Evaluator for BasicEvaluator {
                             if bug == Bug::Pillbug {
                                 pillbug_powers = true;
                             }
-                            if !bug.crawler() {
-                                crawler = false;
-                            }
                         }
                     }
                 }
             };
 
-            if crawler {
+            if crawls(board, hex) {
                 // Treat blocked crawlers as immovable.
                 if board.slidable_adjacent(&mut buf, hex, hex).next().is_none() {
                     immovable.set(hex);

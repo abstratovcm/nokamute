@@ -146,6 +146,14 @@ impl<W: Write> UhpServer<W> {
         Ok(())
     }
 
+    // Unofficial command: the strategy scalars (scalars.rs), comma separated, side to move first.
+    fn scalars(&mut self) -> Result<()> {
+        let board = self.board.as_ref().ok_or(UhpError::GameNotStarted)?;
+        let values = crate::scalars(board).iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        writeln!(self.output, "{}", values.join(","))?;
+        Ok(())
+    }
+
     // Unofficial command: the learned evaluation's active features as `own;opp;hand`.
     fn features(&mut self) -> Result<()> {
         let board = self.board.as_ref().ok_or(UhpError::GameNotStarted)?;
@@ -324,6 +332,7 @@ impl<W: Write> UhpServer<W> {
             "bestmove" => self.best_move(args),
             "search" => self.search(args),
             "eval" => self.eval(),
+            "scalars" => self.scalars(),
             "features" => self.features(),
             "pv" => self.pv(),
             "undo" => self.undo(args),
@@ -615,6 +624,14 @@ mod tests {
         outs.push(command(&mut server, "search depth 3"));
         assert!(!outs[0].contains("err"), "{outs:?}");
         assert!(outs.iter().all(|out| out == &outs[0]), "{outs:?}");
+    }
+
+    #[test]
+    fn scalars_reports_twelve_counts() {
+        let mut server = test_server();
+        assert!(command(&mut server, "scalars").contains("err"));
+        command(&mut server, "newgame Base;;;wA1;bA1 wA1-;wQ -wA1;bQ bA1-");
+        assert_eq!(command(&mut server, "scalars"), "1,1,1,1,5,5,1,1,5,5,0,0");
     }
 
     #[test]

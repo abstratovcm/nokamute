@@ -128,4 +128,9 @@ impl HexSet {
     pub(crate) fn get(&self, hex: Hex) -> bool {
         (self.table[hex as usize & HEXSET_MASK] >> (hex as u32 >> HEXSET_SHIFT)) & 1 != 0
     }
+
+    // Number of hexes in this set and not in other.
+    pub(crate) fn count_without(&self, other: &HexSet) -> u32 {
+        self.table.iter().zip(&other.table).map(|(a, b)| (a & !b).count_ones()).sum()
+    }
 }
