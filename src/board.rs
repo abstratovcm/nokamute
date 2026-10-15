@@ -373,6 +373,9 @@ impl Board {
             }
             _ => {}
         };
+        if self.nnue.is_some() && turn != Turn::Pass {
+            self.nnue_commit();
+        }
         self.turn_num += 1;
         // Encode positions differently based on who is to move.
         self.zobrist_hash ^= 0xa6c11b626b105b7c;

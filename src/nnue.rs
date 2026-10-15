@@ -44,8 +44,11 @@ const BUG_ORDER: [Bug; 8] = [
     Bug::Pillbug,
 ];
 
+// Position of each bug (by its discriminant) in BUG_ORDER.
+const BUG_INDEX: [usize; 8] = [0, 3, 4, 1, 2, 5, 6, 7];
+
 fn bug_index(bug: Bug) -> usize {
-    BUG_ORDER.iter().position(|&b| b == bug).unwrap()
+    BUG_INDEX[bug as usize]
 }
 
 pub struct Nnue {
@@ -322,9 +325,12 @@ impl Nnue {
     }
 
     fn hand_row(&self, slot: usize, count: usize) -> &[i16] {
-        let h = self.hidden;
-        let row = (slot * (MAX_COUNT + 1) + count.min(MAX_COUNT)) * h;
-        &self.hand_rows[row..row + h]
+        let row = self.hand_row_start(slot, count);
+        &self.hand_rows[row..row + self.hidden]
+    }
+
+    fn hand_row_start(&self, slot: usize, count: usize) -> usize {
+        (slot * (MAX_COUNT + 1) + count.min(MAX_COUNT)) * self.hidden
     }
 
     // Activations of one perspective from scratch (a board without accumulators).
@@ -432,6 +438,19 @@ pub struct NnueState {
     // Entries beyond `len` stay allocated for the next time the line gets that deep.
     stack: Vec<NnueEntry>,
     len: usize,
+    // Row changes of the move being applied, recorded by the hooks in order and written into
+    // the new entry by Board::nnue_commit: at most 3 (a placement: the piece, then the hand).
+    ops: [RowOp; 3],
+    num_ops: usize,
+}
+
+// One row change: a row of the feature table or of the hand rows, at element offset `start`
+// for each perspective, added or subtracted.
+#[derive(Clone, Copy, Default)]
+struct RowOp {
+    sub: bool,
+    hand: bool,
+    start: [usize; 2],
 }
 
 #[derive(Clone)]
@@ -443,13 +462,32 @@ struct NnueEntry {
 // A copy only takes the current position; undoing below it rebuilds (see Board::nnue_pop).
 impl Clone for NnueState {
     fn clone(&self) -> Self {
-        NnueState { net: self.net.clone(), stack: vec![self.stack[self.len - 1].clone()], len: 1 }
+        NnueState {
+            net: self.net.clone(),
+            stack: vec![self.stack[self.len - 1].clone()],
+            len: 1,
+            ops: [RowOp::default(); 3],
+            num_ops: 0,
+        }
     }
 }
 
 impl NnueState {
     fn top(&self) -> &NnueEntry {
         &self.stack[self.len - 1]
+    }
+
+    fn record(&mut self, op: RowOp) {
+        // Only Board::apply changes pieces while a net is attached, and a move records 2 ops,
+        // a placement 3; anything else would need its own commit.
+        assert!(self.num_ops < self.ops.len(), "piece changed outside Board::apply");
+        self.ops[self.num_ops] = op;
+        self.num_ops += 1;
+    }
+
+    // The anchors of the position the move is applied to.
+    fn parent_anchor(&self, color: Color) -> Hex {
+        self.stack[self.len - 2].anchor[color as usize]
     }
 }
 
@@ -475,28 +513,52 @@ impl Board {
         for color in [Color::White, Color::Black] {
             net.rebuild(self, &mut entry, color);
         }
-        self.nnue = Some(Box::new(NnueState { net, stack: vec![entry], len: 1 }));
+        let ops = [RowOp::default(); 3];
+        self.nnue = Some(Box::new(NnueState { net, stack: vec![entry], len: 1, ops, num_ops: 0 }));
     }
 
-    // Before a move changes any piece: the new ply starts from a copy of the current entry.
+    // Before a move changes any piece: a new ply, written by nnue_commit once the move is on
+    // the board (a slot left from a deeper line is overwritten in full).
     pub(crate) fn nnue_push(&mut self) {
         let state = self.nnue.as_mut().unwrap();
-        let h = state.net.hidden;
         if state.len == state.stack.len() {
             let copy = state.stack[state.len - 1].clone();
             state.stack.push(copy);
-        } else {
-            let (below, above) = state.stack.split_at_mut(state.len);
-            let (top, next) = (&below[state.len - 1], &mut above[0]);
-            for p in 0..2 {
-                next.acc[p][..h].copy_from_slice(&top.acc[p][..h]);
-            }
-            next.anchor = top.anchor;
         }
+        state.num_ops = 0;
         state.len += 1;
     }
 
-    // After a move was undone (with the hooks off): back to the previous ply's entry, or, if
+    // After the move is on the board: the new entry is the previous one with the recorded rows
+    // applied in one pass, or rebuilt for a perspective whose anchor moved (a queen it is
+    // anchored on was placed or moved; the recorded rows do not matter then).
+    pub(crate) fn nnue_commit(&mut self) {
+        let mut state = self.nnue.take().unwrap();
+        let NnueState { net, stack, len, ops, num_ops } = &mut *state;
+        let h = net.hidden;
+        let (below, above) = stack.split_at_mut(*len - 1);
+        let (parent, child) = (&below[*len - 2], &mut above[0]);
+        for p in [Color::White, Color::Black] {
+            let anchor = Nnue::anchor(self, p);
+            if anchor != parent.anchor[p as usize] {
+                net.rebuild(self, child, p);
+                continue;
+            }
+            let mut rows: [(&[i16], bool); 3] = [(&[], false); 3];
+            for (row, op) in rows.iter_mut().zip(&ops[..*num_ops]) {
+                let start = op.start[p as usize];
+                let table = if op.hand { &net.hand_rows } else { &net.ft };
+                *row = (&table[start..start + h], op.sub);
+            }
+            let (from, to) = (&parent.acc[p as usize][..h], &mut child.acc[p as usize][..h]);
+            update_rows(to, from, &rows[..*num_ops], net.avx2);
+            child.anchor[p as usize] = anchor;
+        }
+        *num_ops = 0;
+        self.nnue = Some(state);
+    }
+
+    // After the move was undone (with the hooks off): back to the previous ply's entry, or, if
     // the move was applied before the net was attached (or copied), rebuilt from the board.
     pub(crate) fn nnue_pop(&mut self) {
         let mut state = self.nnue.take().unwrap();
@@ -511,75 +573,70 @@ impl Board {
         self.nnue = Some(state);
     }
 
-    // After a piece landed on `hex` (placed or moved there).
+    // After a piece landed on `hex` (placed or moved there). The offset is taken from the
+    // anchor as it is now; if that differs from the previous ply's, the commit rebuilds.
     pub(crate) fn nnue_on_insert(&mut self, hex: Hex, bug: Bug, color: Color) {
         let level = self.height(hex) - 1;
-        let mut state = self.nnue.take().unwrap();
-        let NnueState { net, stack, len } = &mut *state;
-        let entry = &mut stack[*len - 1];
-        let h = net.hidden;
+        let anchors = [Nnue::anchor(self, Color::White), Nnue::anchor(self, Color::Black)];
+        let state = self.nnue.as_mut().unwrap();
+        let mut start = [0; 2];
         for p in [Color::White, Color::Black] {
-            let anchor = Nnue::anchor(self, p);
-            if anchor != entry.anchor[p as usize] {
-                // A queen this perspective is anchored on moved: every offset changed.
-                net.rebuild(self, entry, p);
-                continue;
-            }
-            let (dq, dr) = Nnue::offset(hex, anchor);
-            let f = net.feature(dq, dr, color != p, bug, level);
-            add_row(&mut entry.acc[p as usize][..h], &net.ft[f * h..(f + 1) * h]);
+            let (dq, dr) = Nnue::offset(hex, anchors[p as usize]);
+            start[p as usize] =
+                state.net.feature(dq, dr, color != p, bug, level) * state.net.hidden;
         }
-        self.nnue = Some(state);
+        state.record(RowOp { sub: false, hand: false, start });
     }
 
-    // Before the top piece of `hex` leaves (moved away). A leaving queen only loses its own
-    // row here; the perspectives anchored on it are rebuilt by the insert that completes the
-    // move.
+    // Before the top piece of `hex` leaves (moved away), with the previous ply's anchors.
     pub(crate) fn nnue_on_remove(&mut self, hex: Hex) {
         let node = self.node(hex);
         let level = self.height(hex) - 1;
-        let mut state = self.nnue.take().unwrap();
-        let NnueState { net, stack, len } = &mut *state;
-        let entry = &mut stack[*len - 1];
-        let h = net.hidden;
+        let state = self.nnue.as_mut().unwrap();
+        let mut start = [0; 2];
         for p in [Color::White, Color::Black] {
-            let (dq, dr) = Nnue::offset(hex, entry.anchor[p as usize]);
-            let f = net.feature(dq, dr, node.color() != p, node.bug(), level);
-            sub_row(&mut entry.acc[p as usize][..h], &net.ft[f * h..(f + 1) * h]);
+            let (dq, dr) = Nnue::offset(hex, state.parent_anchor(p));
+            let f = state.net.feature(dq, dr, node.color() != p, node.bug(), level);
+            start[p as usize] = f * state.net.hidden;
         }
-        self.nnue = Some(state);
+        state.record(RowOp { sub: true, hand: false, start });
     }
 
-    // The count of `bug` in `color`'s hand changed by `delta` (the board already reflects it).
-    // A queen leaving the hand is when it starts to count as placed, so anchors can move here.
+    // The count of `bug` in `color`'s hand changed by `delta` (the board already reflects it):
+    // the hand row of the old count out, the new one in. A queen leaving the hand starts to
+    // count as placed, which can move anchors; the commit sees that.
     pub(crate) fn nnue_on_hand(&mut self, bug: Bug, color: Color, delta: i8) {
-        let mut state = self.nnue.take().unwrap();
-        let NnueState { net, stack, len } = &mut *state;
-        let entry = &mut stack[*len - 1];
-        let h = net.hidden;
         let now = self.remaining[color as usize][bug as usize] as usize;
         let before = (now as i8 - delta) as usize;
+        let state = self.nnue.as_mut().unwrap();
+        let (mut out, mut into) = ([0; 2], [0; 2]);
         for p in [Color::White, Color::Black] {
-            if Nnue::anchor(self, p) != entry.anchor[p as usize] {
-                net.rebuild(self, entry, p);
-                continue;
-            }
             let slot = if color == p { 0 } else { 8 } + bug_index(bug);
-            sub_row(&mut entry.acc[p as usize][..h], net.hand_row(slot, before));
-            add_row(&mut entry.acc[p as usize][..h], net.hand_row(slot, now));
+            out[p as usize] = state.net.hand_row_start(slot, before);
+            into[p as usize] = state.net.hand_row_start(slot, now);
         }
-        self.nnue = Some(state);
+        state.record(RowOp { sub: true, hand: true, start: out });
+        state.record(RowOp { sub: false, hand: true, start: into });
     }
 }
 
-fn sub_row(acc: &mut [i16], row: &[i16]) {
+// to = from with each row added or subtracted in order, with saturating i16 arithmetic,
+// in one pass over the lanes.
+fn update_rows(to: &mut [i16], from: &[i16], rows: &[(&[i16], bool)], avx2: bool) {
+    let mut done = 0;
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        // SAFETY: the feature was detected at runtime.
-        return unsafe { avx2::sub_row(acc, row) };
+    if avx2 {
+        // SAFETY: AVX2 was detected when the net was loaded.
+        done = unsafe { avx2::update_rows(to, from, rows) };
     }
-    for (a, w) in acc.iter_mut().zip(row) {
-        *a = a.saturating_sub(*w);
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = avx2;
+    for i in done..to.len() {
+        let mut v = from[i];
+        for (row, sub) in rows {
+            v = if *sub { v.saturating_sub(row[i]) } else { v.saturating_add(row[i]) };
+        }
+        to[i] = v;
     }
 }
 
@@ -628,17 +685,19 @@ mod avx2 {
         }
     }
 
+    // Whole 16 lane blocks of update_rows; returns how many lanes it wrote.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn sub_row(acc: &mut [i16], row: &[i16]) {
-        let n = acc.len().min(row.len()) / 16 * 16;
+    pub unsafe fn update_rows(to: &mut [i16], from: &[i16], rows: &[(&[i16], bool)]) -> usize {
+        let n = to.len() / 16 * 16;
         for i in (0..n).step_by(16) {
-            let a = _mm256_loadu_si256(acc.as_ptr().add(i) as *const __m256i);
-            let r = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
-            _mm256_storeu_si256(acc.as_mut_ptr().add(i) as *mut __m256i, _mm256_subs_epi16(a, r));
+            let mut v = _mm256_loadu_si256(from.as_ptr().add(i) as *const __m256i);
+            for (row, sub) in rows {
+                let r = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+                v = if *sub { _mm256_subs_epi16(v, r) } else { _mm256_adds_epi16(v, r) };
+            }
+            _mm256_storeu_si256(to.as_mut_ptr().add(i) as *mut __m256i, v);
         }
-        for i in n..acc.len().min(row.len()) {
-            acc[i] = acc[i].saturating_sub(row[i]);
-        }
+        n
     }
 
     // Eight rows of a layer at once: each 32 byte block of the input is loaded once and
@@ -776,6 +835,50 @@ mod tests {
             }
         }
         assert!(history.len() > 20);
+    }
+
+    #[test]
+    fn bug_index_follows_bug_order() {
+        for (i, &bug) in BUG_ORDER.iter().enumerate() {
+            assert_eq!(bug_index(bug), i, "{bug:?}");
+        }
+    }
+
+    // The one pass update must equal adding and subtracting the rows one after the other,
+    // saturation included, on the AVX2 blocks and on the scalar tail.
+    #[test]
+    fn fused_update_matches_row_by_row() {
+        let mut state = 99u32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            // Mostly near the i16 limits, so sums saturate.
+            match state >> 30 {
+                0 => 32767 - (state >> 20 & 255) as i16,
+                1 => -32767 + (state >> 20 & 255) as i16,
+                _ => (state >> 16) as i16,
+            }
+        };
+        for len in [256, 40] {
+            let from: Vec<i16> = (0..len).map(|_| next()).collect();
+            let rows: Vec<Vec<i16>> = (0..3).map(|_| (0..len).map(|_| next()).collect()).collect();
+            for signs in [[false, true, false], [true, false, true], [true, true, true]] {
+                for n in 1..=3 {
+                    let ops: Vec<(&[i16], bool)> =
+                        (0..n).map(|k| (rows[k].as_slice(), signs[k])).collect();
+                    let mut expected = from.clone();
+                    for (row, sub) in &ops {
+                        for (e, r) in expected.iter_mut().zip(row.iter()) {
+                            *e = if *sub { e.saturating_sub(*r) } else { e.saturating_add(*r) };
+                        }
+                    }
+                    for avx2 in [false, avx2_available()] {
+                        let mut to = vec![0i16; len];
+                        update_rows(&mut to, &from, &ops, avx2);
+                        assert_eq!(to, expected, "len {len} ops {n} avx2 {avx2}");
+                    }
+                }
+            }
+        }
     }
 
     fn assert_matches_from_scratch(net: &Nnue, board: &Board, what: &str) {
