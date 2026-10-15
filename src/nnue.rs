@@ -798,6 +798,22 @@ thread_local! {
     static CACHE: std::cell::RefCell<Vec<CacheEntry>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+// Called after a move is applied: start loading the cache slot of the new position, so the
+// evaluation that usually follows does not wait for memory.
+pub(crate) fn prefetch_evaluation(hash: u64) {
+    #[cfg(target_arch = "x86_64")]
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        if let Some(slot) = cache.get((hash >> (64 - CACHE_BITS)) as usize) {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            // SAFETY: a prefetch is a hint and the address is a live slot of the table.
+            unsafe { _mm_prefetch(slot as *const CacheEntry as *const i8, _MM_HINT_T0) };
+        }
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = hash;
+}
+
 impl Evaluator for NnueEvaluator {
     type G = Rules;
 

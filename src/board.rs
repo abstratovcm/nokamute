@@ -305,7 +305,7 @@ impl Board {
     pub(crate) fn queens_surrounded(&self) -> [usize; 2] {
         let mut out = [0; 2];
         for (i, entry) in out.iter_mut().enumerate() {
-            *entry = adjacent(self.queens[i]).iter().filter(|adj| self.occupied(**adj)).count();
+            *entry = self.neighbors[self.queens[i] as usize].count_ones() as usize;
         }
         out
     }
@@ -397,6 +397,9 @@ impl Board {
         self.zobrist_hash ^= 0xa6c11b626b105b7c;
         self.zobrist_history.push(self.zobrist_hash);
         self.turn_history.push(turn);
+        if self.nnue.is_some() {
+            crate::prefetch_evaluation(self.zobrist_hash);
+        }
     }
 
     pub fn undo(&mut self, turn: Turn) {
