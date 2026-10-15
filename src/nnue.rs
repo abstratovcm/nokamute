@@ -790,8 +790,10 @@ mod tests {
     #[test]
     fn accumulator_stack_matches_from_scratch_in_search_trees() {
         use minimax::{Game, Strategy};
-        for scalars in [0, NUM_SCALARS] {
-            let net = Arc::new(tiny_random(scalars));
+        for (scalars, hidden, l2) in
+            [(0, 8, 2), (NUM_SCALARS, 8, 2), (0, 32, 8), (NUM_SCALARS, 32, 8)]
+        {
+            let net = Arc::new(tiny_random_with(scalars, hidden, l2));
             let mut board = Board::from_game_type("Base+MLP").unwrap();
             board.attach_nnue(net.clone());
             let mut random = minimax::Random::<Rules>::new();
@@ -863,7 +865,13 @@ mod tests {
     // Like tiny() but with varied weights, so mismatches cannot cancel out; with scalars, a
     // version 2 file.
     fn tiny_random(scalars: usize) -> Nnue {
-        let (radius, hidden, l2) = (6u32, 8usize, 2usize);
+        tiny_random_with(scalars, 8, 2)
+    }
+
+    // Hidden 32 and l2 8 run the AVX2 paths (16 lane row blocks, the 8 row layer kernel),
+    // which hidden 8 and l2 2 leave to the scalar tails.
+    fn tiny_random_with(scalars: usize, hidden: usize, l2: usize) -> Nnue {
+        let radius = 6u32;
         let num_features = 127 * FEATURES_PER_CELL;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"TOCA");
