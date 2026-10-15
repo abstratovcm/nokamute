@@ -14,7 +14,8 @@
 // arrays ft, hand_w, hand_b, l1_w, l1_b, l2_w, l2_b, out_w, out_b. l1_w rows are the own
 // accumulator, the opponent's, then the scalars.
 
-use crate::{scalar_input, scalars, Board, Bug, Color, Hex, Rules, Turn, NUM_SCALARS, ROW_SIZE};
+use crate::{scalar_input, scalars_with, Board, Bug, Color, Hex, HexSet, Rules, Turn};
+use crate::{NUM_SCALARS, ROW_SIZE};
 use crate::{SCALAR_MAX, START_HEX};
 use minimax::{Evaluation, Evaluator};
 use std::sync::Arc;
@@ -368,7 +369,11 @@ impl Nnue {
             }
         }
         if self.scalars > 0 {
-            for (i, v) in scalars(board).into_iter().enumerate() {
+            let cut = match board.nnue.as_deref() {
+                Some(state) if std::ptr::eq(&*state.net, self) => state.top().cut,
+                _ => None,
+            };
+            for (i, v) in scalars_with(board, cut).into_iter().enumerate() {
                 input[2 * h + i] = scalar_input(v, SCALAR_MAX[i]);
             }
         }
@@ -461,6 +466,8 @@ struct RowOp {
 struct NnueEntry {
     acc: [[i16; MAX_HIDDEN]; 2],
     anchor: [Hex; 2],
+    // The position's cut vertexes, when known without a search (see Board::nnue_push).
+    cut: Option<HexSet>,
 }
 
 // A copy only takes the current position; undoing below it rebuilds (see Board::nnue_pop).
@@ -513,7 +520,7 @@ impl Nnue {
 
 impl Board {
     pub fn attach_nnue(&mut self, net: Arc<Nnue>) {
-        let mut entry = NnueEntry { acc: [[0; MAX_HIDDEN]; 2], anchor: [START_HEX; 2] };
+        let mut entry = NnueEntry { acc: [[0; MAX_HIDDEN]; 2], anchor: [START_HEX; 2], cut: None };
         for color in [Color::White, Color::Black] {
             net.rebuild(self, &mut entry, color);
         }
@@ -523,12 +530,39 @@ impl Board {
 
     // Before a move changes any piece: a new ply, written by nnue_commit once the move is on
     // the board (a slot left from a deeper line is overwritten in full).
-    pub(crate) fn nnue_push(&mut self) {
+    //
+    // A piece placed next to exactly one hex is a leaf of the hive's graph: the new position's
+    // cut vertexes are the old ones plus that neighbour (unless it was the only piece). For
+    // a net with scalars the old set is searched once per position, when its first such
+    // placement is applied, and the new set is kept in the new entry for the evaluation.
+    pub(crate) fn nnue_push(&mut self, turn: Turn) {
+        let mut cut = None;
+        if let Turn::Place(hex, _) = turn {
+            let occupied = self.neighbors[hex as usize];
+            let state = self.nnue.as_ref().unwrap();
+            if state.net.scalars > 0 && occupied.count_ones() == 1 {
+                let mut set = match state.top().cut {
+                    Some(set) => set,
+                    None => {
+                        let set = self.find_cut_vertexes();
+                        let state = self.nnue.as_mut().unwrap();
+                        let len = state.len;
+                        state.stack[len - 1].cut = Some(set);
+                        set
+                    }
+                };
+                if self.occupied_hexes.iter().map(Vec::len).sum::<usize>() > 1 {
+                    set.set(crate::adjacent(hex)[occupied.trailing_zeros() as usize]);
+                }
+                cut = Some(set);
+            }
+        }
         let state = self.nnue.as_mut().unwrap();
         if state.len == state.stack.len() {
             let copy = state.stack[state.len - 1].clone();
             state.stack.push(copy);
         }
+        state.stack[state.len].cut = cut;
         state.num_ops = 0;
         state.len += 1;
     }
@@ -573,6 +607,7 @@ impl Board {
             for color in [Color::White, Color::Black] {
                 net.rebuild(self, &mut stack[0], color);
             }
+            stack[0].cut = None;
         }
         self.nnue = Some(state);
     }
@@ -946,6 +981,17 @@ mod tests {
         let mut fresh = board.clone();
         fresh.nnue = None;
         assert_eq!(net.evaluate(board), net.evaluate(&fresh), "{what}");
+        if let Some(cut) = board.nnue.as_deref().and_then(|state| state.top().cut) {
+            let full = board.find_cut_vertexes();
+            for hex in 0..crate::GRID_SIZE as Hex {
+                assert_eq!(cut.get(hex), full.get(hex), "{what}: kept cut vertexes, hex {hex}");
+            }
+            KEPT_CUTS.with(|n| n.set(n.get() + 1));
+        }
+    }
+
+    thread_local! {
+        static KEPT_CUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     // The search's pattern: along a random game, try children and grandchildren of every
@@ -998,6 +1044,9 @@ mod tests {
                 assert_matches_from_scratch(&net, &board, &format!("ply {ply}"));
             }
             assert!(queen_placed > 0 && queen_moved > 0, "{queen_placed} {queen_moved}");
+            if scalars > 0 {
+                assert!(KEPT_CUTS.with(|n| n.get()) > 0, "no kept cut vertexes checked");
+            }
         }
     }
 

@@ -112,6 +112,7 @@ const HEXSET_NUM_WORDS: usize = GRID_SIZE / 32;
 const HEXSET_SHIFT: u32 = GRID_SIZE.trailing_zeros() - 5;
 const HEXSET_MASK: usize = HEXSET_NUM_WORDS - 1;
 
+#[derive(Clone, Copy)]
 pub(crate) struct HexSet {
     table: [u32; HEXSET_NUM_WORDS],
 }

@@ -16,8 +16,13 @@ pub const NUM_SCALARS: usize = 12;
 pub const SCALAR_MAX: [u32; NUM_SCALARS] = [14, 14, 14, 14, 6, 6, 6, 6, 24, 24, 1, 1];
 
 pub fn scalars(board: &Board) -> [u8; NUM_SCALARS] {
+    scalars_with(board, None)
+}
+
+// `cut`, when known, is the board's set of cut vertexes (see Board::nnue_push).
+pub(crate) fn scalars_with(board: &Board, cut: Option<HexSet>) -> [u8; NUM_SCALARS] {
     // One pass over the bugs, reading which neighbours are occupied from the board's masks.
-    let cut = board.find_cut_vertexes();
+    let cut = cut.unwrap_or_else(|| board.find_cut_vertexes());
     let mut immovable = HexSet::new();
     let mut movable = [0u8; 2];
     let mut pinned = [0u8; 2];

@@ -371,7 +371,7 @@ pub enum Turn {
 impl Board {
     pub fn apply(&mut self, turn: Turn) {
         if self.nnue.is_some() && turn != Turn::Pass {
-            self.nnue_push();
+            self.nnue_push(turn);
         }
         match turn {
             Turn::Place(hex, bug) => {
