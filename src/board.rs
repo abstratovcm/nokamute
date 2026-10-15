@@ -106,6 +106,8 @@ impl UnderNode {
 pub struct Board {
     // Indexed by Hex.
     pub(crate) nodes: [Node; GRID_SIZE],
+    // Occupied neighbours of every hex: bit k is set when adjacent(hex)[k] is occupied.
+    pub(crate) neighbors: [u8; GRID_SIZE],
     // Tiles that are under other tiles.
     // Sorted by height (for each hex) and no gaps.
     underworld: [UnderNode; 8],
@@ -191,6 +193,10 @@ impl Board {
             }
         } else {
             self.occupied_add(color, hex);
+            // adjacent() is clockwise, so direction k + 3 points back at hex.
+            for (k, adj) in adjacent(hex).into_iter().enumerate() {
+                self.neighbors[adj as usize] |= 1 << ((k + 3) % 6);
+            }
         }
         if prev.occupied() {
             self.insert_underworld(prev, hex);
@@ -226,6 +232,9 @@ impl Board {
             }
         } else {
             self.occupied_remove(color, hex);
+            for (k, adj) in adjacent(hex).into_iter().enumerate() {
+                self.neighbors[adj as usize] &= !(1 << ((k + 3) % 6));
+            }
         }
 
         self.zobrist_hash ^= self.zobrist(hex, bug, color, height);
@@ -314,6 +323,7 @@ impl Board {
 
         Board {
             nodes: [Node::empty(); GRID_SIZE],
+            neighbors: [0; GRID_SIZE],
             underworld: [UnderNode::empty(); 8],
             underworld_size: 0,
             remaining: [remaining; 2],
@@ -472,10 +482,11 @@ impl Board {
             state.visit_num += 1;
             let root = hex == parent;
             let mut children = 0;
-            for adj in adjacent(hex) {
-                if !state.board.occupied(adj) {
-                    continue;
-                }
+            let around = adjacent(hex);
+            let mut occupied = state.board.neighbors[hex as usize];
+            while occupied != 0 {
+                let adj = around[occupied.trailing_zeros() as usize];
+                occupied &= occupied - 1;
                 if adj == parent {
                     continue;
                 }
@@ -1067,6 +1078,99 @@ mod tests {
             &turns,
             &[((-1, -1), Bug::Queen), ((-1, 0), Bug::Queen), ((0, 1), Bug::Queen)],
         );
+    }
+
+    impl Board {
+        // The version that scans the grid for neighbours: the reference for the masks.
+        fn find_cut_vertexes_on_grid(&self) -> HexSet {
+            struct State<'a> {
+                board: &'a Board,
+                visited: HexSet,
+                immovable: HexSet,
+                // Visitation number in DFS traversal.
+                num: [u8; GRID_SIZE],
+                // Lowest-numbered node reachable using DFS edges and then at most
+                // one back edge.
+                low: [u8; GRID_SIZE],
+                visit_num: u8,
+            }
+            let mut state = State {
+                board: self,
+                visited: HexSet::new(),
+                immovable: HexSet::new(),
+                num: [0; GRID_SIZE],
+                low: [0; GRID_SIZE],
+                visit_num: 1,
+            };
+            fn dfs(state: &mut State, hex: Hex, parent: Hex) {
+                state.visited.set(hex);
+                state.num[hex as usize] = state.visit_num;
+                state.low[hex as usize] = state.visit_num;
+                state.visit_num += 1;
+                let root = hex == parent;
+                let mut children = 0;
+                for adj in adjacent(hex) {
+                    if !state.board.occupied(adj) {
+                        continue;
+                    }
+                    if adj == parent {
+                        continue;
+                    }
+                    if state.visited.get(adj) {
+                        state.low[hex as usize] =
+                            min(state.low[hex as usize], state.num[adj as usize]);
+                    } else {
+                        dfs(state, adj, hex);
+                        state.low[hex as usize] =
+                            min(state.low[hex as usize], state.low[adj as usize]);
+                        if state.low[adj as usize] >= state.num[hex as usize] && !root {
+                            state.immovable.set(hex);
+                        }
+                        children += 1;
+                    }
+                }
+                if root && children > 1 {
+                    state.immovable.set(hex);
+                }
+            }
+
+            let start = self.queens[0]; // Some occupied node.
+            dfs(&mut state, start, start);
+            state.immovable
+        }
+    }
+
+    // The neighbour masks and the searches that read them, against the grid, along random
+    // games (moves and placements, stacks, pieces leaving hexes).
+    #[test]
+    fn neighbor_masks_follow_the_board() {
+        use minimax::Strategy;
+        for _ in 0..40 {
+            let mut board = Board::from_game_type("Base+MLP").unwrap();
+            let mut random = minimax::Random::<Rules>::new();
+            for ply in 0..150 {
+                for hex in 0..GRID_SIZE as Hex {
+                    let expected = adjacent(hex)
+                        .iter()
+                        .enumerate()
+                        .fold(0, |m, (k, &a)| m | ((board.occupied(a) as u8) << k));
+                    assert_eq!(board.neighbors[hex as usize], expected, "ply {ply}, hex {hex}");
+                }
+                let (cut, grid) = (board.find_cut_vertexes(), board.find_cut_vertexes_on_grid());
+                for hex in 0..GRID_SIZE as Hex {
+                    assert_eq!(cut.get(hex), grid.get(hex), "ply {ply}, hex {hex}");
+                }
+                if Rules::get_winner(&board).is_some() {
+                    break;
+                }
+                let m = random.choose_move(&board).unwrap();
+                board.apply(m);
+                if ply % 5 == 4 {
+                    board.undo(m);
+                    board.apply(m);
+                }
+            }
+        }
     }
 
     #[test]
