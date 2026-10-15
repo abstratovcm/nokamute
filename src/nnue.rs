@@ -56,6 +56,14 @@ pub struct Nnue {
     scale: f32,
     // Strategy scalars fed to the first layer: 0 or NUM_SCALARS.
     scalars: usize,
+    // Layer rows are stored this many bytes apart, padded with zero weights to whole 32 byte
+    // blocks (the inputs are zero there too, so the sums do not change).
+    l1_stride: usize,
+    l2_stride: usize,
+    // Whether the layers run the AVX2 kernel, checked once at load.
+    avx2: bool,
+    // Cell of every wrapped (dq, dr) offset, far offsets already projected onto the ring.
+    offset_cell: Vec<u16>,
     // (dq + radius) * (2 * radius + 1) + (dr + radius) -> cell index, same order as tocandira.
     cell_index: Vec<usize>,
     // Feature table rows and biases in accumulator units (ACT_SCALE per unit).
@@ -180,24 +188,40 @@ impl Nnue {
         if pos != buf.len() {
             return Err(std::io::Error::other("nnue file has trailing bytes"));
         }
-        Ok(Nnue {
+        let l1_stride = padded(2 * hidden + scalars);
+        let l2_stride = padded(l2);
+        let mut net = Nnue {
             radius,
             num_features,
             hidden,
             l2,
             scale,
             scalars,
+            l1_stride,
+            l2_stride,
+            avx2: avx2_available(),
+            offset_cell: Vec::new(),
             cell_index,
             ft: quantize_i16(&ft, ACT_SCALE),
             hand_rows: quantize_i16(&hand_rows, ACT_SCALE),
             hand_b: quantize_i16(&hand_b, ACT_SCALE),
-            l1_w: quantize_i8(&l1_w, WEIGHT_SCALE),
+            l1_w: pad_rows(&quantize_i8(&l1_w, WEIGHT_SCALE), 2 * hidden + scalars, l1_stride),
             l1_b: quantize_i32(&l1_b, ACT_SCALE * WEIGHT_SCALE),
-            l2_w: quantize_i8(&l2_w, WEIGHT_SCALE),
+            l2_w: pad_rows(&quantize_i8(&l2_w, WEIGHT_SCALE), l2, l2_stride),
             l2_b: quantize_i32(&l2_b, ACT_SCALE * WEIGHT_SCALE),
             out_w,
             out_b,
-        })
+        };
+        let row = ROW_SIZE as i32;
+        for dq in -row / 2..row / 2 {
+            for dr in -row / 2..row / 2 {
+                let (cq, cr) = net.clamp(dq, dr);
+                let width = (2 * radius + 1) as usize;
+                let cell = net.cell_index[(cq + radius) as usize * width + (cr + radius) as usize];
+                net.offset_cell.push(cell as u16);
+            }
+        }
+        Ok(net)
     }
 
     // Offsets beyond the radius are projected onto the ring, rounding in cube coordinates.
@@ -222,10 +246,8 @@ impl Nnue {
     }
 
     fn feature(&self, dq: i32, dr: i32, enemy: bool, bug: Bug, level: u8) -> usize {
-        let (dq, dr) = self.clamp(dq, dr);
-        let width = (2 * self.radius + 1) as usize;
-        let cell =
-            self.cell_index[(dq + self.radius) as usize * width + (dr + self.radius) as usize];
+        let row = ROW_SIZE as i32;
+        let cell = self.offset_cell[((dq + row / 2) * row + (dr + row / 2)) as usize] as usize;
         let within =
             (enemy as usize * 8 + bug_index(bug)) * LEVELS + (level as usize).min(LEVELS - 1);
         cell * FEATURES_PER_CELL + within
@@ -306,7 +328,7 @@ impl Nnue {
     }
 
     // Activations of one perspective from scratch (a board without accumulators).
-    fn activations(&self, board: &Board, color: Color, act: &mut [u8; MAX_HIDDEN]) {
+    fn activations(&self, board: &Board, color: Color, act: &mut [u8]) {
         let h = self.hidden;
         let mut acc = [0i16; MAX_HIDDEN];
         self.accumulate_pieces(board, color, &mut acc[..h]);
@@ -323,43 +345,75 @@ impl Nnue {
         let me = board.to_move();
         let them = if me == Color::White { Color::Black } else { Color::White };
         let h = self.hidden;
-        let mut own = [0u8; MAX_HIDDEN];
-        let mut opp = [0u8; MAX_HIDDEN];
+        // First layer input: own activations, the opponent's, the scalars, zero padding.
+        let mut input = [0u8; 2 * MAX_HIDDEN + 32];
         match board.nnue.as_deref() {
             Some(state) if std::ptr::eq(&*state.net, self) => {
-                clip(&state.acc[me as usize][..h], &mut own[..h]);
-                clip(&state.acc[them as usize][..h], &mut opp[..h]);
+                clip(&state.acc[me as usize][..h], &mut input[..h]);
+                clip(&state.acc[them as usize][..h], &mut input[h..2 * h]);
             }
             _ => {
-                self.activations(board, me, &mut own);
-                self.activations(board, them, &mut opp);
+                self.activations(board, me, &mut input[..h]);
+                self.activations(board, them, &mut input[h..2 * h]);
             }
         }
-        let mut inputs = [0u8; NUM_SCALARS];
         if self.scalars > 0 {
             for (i, v) in scalars(board).into_iter().enumerate() {
-                inputs[i] = scalar_input(v, SCALAR_MAX[i]);
+                input[2 * h + i] = scalar_input(v, SCALAR_MAX[i]);
             }
         }
-        let s = self.scalars;
         let mut x = [0u8; MAX_L2];
-        for (i, row) in self.l1_w.chunks_exact(2 * h + s).enumerate() {
-            let sum = dot(&own[..h], &row[..h])
-                + dot(&opp[..h], &row[h..2 * h])
-                + dot(&inputs[..s], &row[2 * h..])
-                + self.l1_b[i];
-            x[i] = (sum >> WEIGHT_SHIFT).clamp(0, ACT_SCALE as i32) as u8;
-        }
+        self.layer(&input, &self.l1_w, &self.l1_b, self.l1_stride, &mut x[..self.l2]);
         let mut y = [0u8; MAX_L2];
-        for (i, row) in self.l2_w.chunks_exact(self.l2).enumerate() {
-            let sum = dot(&x[..self.l2], row) + self.l2_b[i];
-            y[i] = (sum >> WEIGHT_SHIFT).clamp(0, ACT_SCALE as i32) as u8;
-        }
+        self.layer(&x, &self.l2_w, &self.l2_b, self.l2_stride, &mut y[..self.l2]);
         let out: f32 =
             self.out_w.iter().zip(&y).map(|(w, &a)| w * a as f32 / ACT_SCALE as f32).sum::<f32>()
                 + self.out_b;
         (out * self.scale).clamp(-SCORE_LIMIT, SCORE_LIMIT).round() as Evaluation
     }
+}
+
+impl Nnue {
+    // One clipped layer: out[i] = clamp((row i . input + bias i) >> WEIGHT_SHIFT, 0, 127),
+    // eight rows at a time with AVX2, the rest one by one.
+    fn layer(&self, input: &[u8], weights: &[i8], bias: &[i32], stride: usize, out: &mut [u8]) {
+        let input = &input[..stride];
+        let mut i = 0;
+        #[cfg(target_arch = "x86_64")]
+        if self.avx2 {
+            while i + 8 <= out.len() {
+                let rows = &weights[i * stride..(i + 8) * stride];
+                // SAFETY: AVX2 was detected when the net was loaded.
+                unsafe { avx2::layer8(input, rows, stride, &bias[i..i + 8], &mut out[i..i + 8]) };
+                i += 8;
+            }
+        }
+        for i in i..out.len() {
+            let sum = dot_scalar(input, &weights[i * stride..(i + 1) * stride]) + bias[i];
+            out[i] = (sum >> WEIGHT_SHIFT).clamp(0, ACT_SCALE as i32) as u8;
+        }
+    }
+}
+
+// Row length rounded up to whole 32 byte blocks.
+fn padded(n: usize) -> usize {
+    n.div_ceil(32) * 32
+}
+
+fn pad_rows(weights: &[i8], cols: usize, stride: usize) -> Vec<i8> {
+    let mut out = Vec::with_capacity(weights.len() / cols * stride);
+    for row in weights.chunks_exact(cols) {
+        out.extend_from_slice(row);
+        out.resize(out.len() + stride - cols, 0);
+    }
+    out
+}
+
+fn avx2_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    false
 }
 
 fn clip(acc: &[i16], act: &mut [u8]) {
@@ -473,15 +527,6 @@ fn add_row(acc: &mut [i16], row: &[i16]) {
 }
 
 // Activations (0..127) against int8 weights, summed in int32.
-fn dot(act: &[u8], w: &[i8]) -> i32 {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        // SAFETY: the feature was detected at runtime.
-        return unsafe { avx2::dot(act, w) };
-    }
-    dot_scalar(act, w)
-}
-
 fn dot_scalar(act: &[u8], w: &[i8]) -> i32 {
     let mut lanes = [0i32; 8];
     let mut ca = act.chunks_exact(8);
@@ -528,25 +573,42 @@ mod avx2 {
         }
     }
 
+    // Eight rows of a layer at once: each 32 byte block of the input is loaded once and
+    // multiplied into eight running sums, which one reduction turns into the eight outputs,
+    // then bias, shift and clamp to 0..127 as in the scalar path.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn dot(act: &[u8], w: &[i8]) -> i32 {
-        let len = act.len().min(w.len());
-        let n = len / 32 * 32;
+    pub unsafe fn layer8(input: &[u8], rows: &[i8], stride: usize, bias: &[i32], out: &mut [u8]) {
         let ones = _mm256_set1_epi16(1);
-        let mut sum = _mm256_setzero_si256();
-        for i in (0..n).step_by(32) {
-            let a = _mm256_loadu_si256(act.as_ptr().add(i) as *const __m256i);
-            let b = _mm256_loadu_si256(w.as_ptr().add(i) as *const __m256i);
-            // Pairs of u8 * i8 products summed into i16 (127 * 127 * 2 fits), then into i32.
-            sum = _mm256_add_epi32(sum, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        let mut acc = [_mm256_setzero_si256(); 8];
+        for c in (0..stride).step_by(32) {
+            let a = _mm256_loadu_si256(input.as_ptr().add(c) as *const __m256i);
+            for (k, sum) in acc.iter_mut().enumerate() {
+                let w = _mm256_loadu_si256(rows.as_ptr().add(k * stride + c) as *const __m256i);
+                // Pairs of u8 * i8 products summed into i16 (127 * 127 * 2 fits), then into i32.
+                let products = _mm256_madd_epi16(_mm256_maddubs_epi16(a, w), ones);
+                *sum = _mm256_add_epi32(*sum, products);
+            }
         }
-        let halves = _mm_add_epi32(_mm256_castsi256_si128(sum), _mm256_extracti128_si256(sum, 1));
-        let quads = _mm_add_epi32(halves, _mm_srli_si128(halves, 8));
-        let mut total = _mm_cvtsi128_si32(_mm_add_epi32(quads, _mm_srli_si128(quads, 4)));
-        for i in n..len {
-            total += act[i] as i32 * w[i] as i32;
+        // Lane l of s0123 holds the four row sums of 128 bit half l, rows 0-3; likewise 4-7.
+        let s01 = _mm256_hadd_epi32(acc[0], acc[1]);
+        let s23 = _mm256_hadd_epi32(acc[2], acc[3]);
+        let s45 = _mm256_hadd_epi32(acc[4], acc[5]);
+        let s67 = _mm256_hadd_epi32(acc[6], acc[7]);
+        let s0123 = _mm256_hadd_epi32(s01, s23);
+        let s4567 = _mm256_hadd_epi32(s45, s67);
+        let sums = _mm256_add_epi32(
+            _mm256_permute2x128_si256(s0123, s4567, 0x20),
+            _mm256_permute2x128_si256(s0123, s4567, 0x31),
+        );
+        let v = _mm256_add_epi32(sums, _mm256_loadu_si256(bias.as_ptr() as *const __m256i));
+        let v = _mm256_srai_epi32(v, super::WEIGHT_SHIFT as i32);
+        let v =
+            _mm256_min_epi32(_mm256_max_epi32(v, _mm256_setzero_si256()), _mm256_set1_epi32(127));
+        let mut values = [0i32; 8];
+        _mm256_storeu_si256(values.as_mut_ptr() as *mut __m256i, v);
+        for (o, v) in out.iter_mut().zip(values) {
+            *o = v as u8;
         }
-        total
     }
 }
 
