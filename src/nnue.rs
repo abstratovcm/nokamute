@@ -349,8 +349,8 @@ impl Nnue {
         let mut input = [0u8; 2 * MAX_HIDDEN + 32];
         match board.nnue.as_deref() {
             Some(state) if std::ptr::eq(&*state.net, self) => {
-                clip(&state.acc[me as usize][..h], &mut input[..h]);
-                clip(&state.acc[them as usize][..h], &mut input[h..2 * h]);
+                clip(&state.top().acc[me as usize][..h], &mut input[..h]);
+                clip(&state.top().acc[them as usize][..h], &mut input[h..2 * h]);
             }
             _ => {
                 self.activations(board, me, &mut input[..h]);
@@ -423,32 +423,89 @@ fn clip(acc: &[i16], act: &mut [u8]) {
 }
 
 // Accumulators kept inside a Board: bias, one table row per piece on the board and one row
-// per (bug, count) in hand, for each perspective colour. Pieces are added and removed as
-// the board changes; a queen appearing or leaving changes the anchors, so that refreshes
-// both perspectives from scratch.
-#[derive(Clone)]
+// per (bug, count) in hand, for each perspective colour, one entry per ply of the current
+// line. Applying a move copies the top entry and updates the copy; undoing it drops the copy,
+// so an undo costs nothing. A perspective is rebuilt from scratch only when its anchor (see
+// Nnue::anchor) moved: a queen it is anchored on was placed or moved.
 pub struct NnueState {
     net: Arc<Nnue>,
+    // Entries beyond `len` stay allocated for the next time the line gets that deep.
+    stack: Vec<NnueEntry>,
+    len: usize,
+}
+
+#[derive(Clone)]
+struct NnueEntry {
     acc: [[i16; MAX_HIDDEN]; 2],
+    anchor: [Hex; 2],
+}
+
+// A copy only takes the current position; undoing below it rebuilds (see Board::nnue_pop).
+impl Clone for NnueState {
+    fn clone(&self) -> Self {
+        NnueState { net: self.net.clone(), stack: vec![self.stack[self.len - 1].clone()], len: 1 }
+    }
+}
+
+impl NnueState {
+    fn top(&self) -> &NnueEntry {
+        &self.stack[self.len - 1]
+    }
+}
+
+impl Nnue {
+    // `color`'s accumulator of `entry` from scratch, and its anchor.
+    fn rebuild(&self, board: &Board, entry: &mut NnueEntry, color: Color) {
+        let h = self.hidden;
+        let acc = &mut entry.acc[color as usize];
+        self.accumulate_pieces(board, color, &mut acc[..h]);
+        for (slot, c) in [color as usize, color.other()].into_iter().enumerate() {
+            for (j, bug) in BUG_ORDER.iter().enumerate() {
+                let count = board.remaining[c][*bug as usize] as usize;
+                add_row(&mut acc[..h], self.hand_row(slot * 8 + j, count));
+            }
+        }
+        entry.anchor[color as usize] = Nnue::anchor(board, color);
+    }
 }
 
 impl Board {
     pub fn attach_nnue(&mut self, net: Arc<Nnue>) {
-        self.nnue = Some(Box::new(NnueState { net, acc: [[0; MAX_HIDDEN]; 2] }));
-        self.nnue_refresh();
+        let mut entry = NnueEntry { acc: [[0; MAX_HIDDEN]; 2], anchor: [START_HEX; 2] };
+        for color in [Color::White, Color::Black] {
+            net.rebuild(self, &mut entry, color);
+        }
+        self.nnue = Some(Box::new(NnueState { net, stack: vec![entry], len: 1 }));
     }
 
-    fn nnue_refresh(&mut self) {
-        let mut state = self.nnue.take().unwrap();
+    // Before a move changes any piece: the new ply starts from a copy of the current entry.
+    pub(crate) fn nnue_push(&mut self) {
+        let state = self.nnue.as_mut().unwrap();
         let h = state.net.hidden;
-        for color in [Color::White, Color::Black] {
-            let acc = &mut state.acc[color as usize];
-            state.net.accumulate_pieces(self, color, acc);
-            for (slot, c) in [color as usize, color.other()].into_iter().enumerate() {
-                for (j, bug) in BUG_ORDER.iter().enumerate() {
-                    let count = self.remaining[c][*bug as usize] as usize;
-                    add_row(&mut acc[..h], state.net.hand_row(slot * 8 + j, count));
-                }
+        if state.len == state.stack.len() {
+            let copy = state.stack[state.len - 1].clone();
+            state.stack.push(copy);
+        } else {
+            let (below, above) = state.stack.split_at_mut(state.len);
+            let (top, next) = (&below[state.len - 1], &mut above[0]);
+            for p in 0..2 {
+                next.acc[p][..h].copy_from_slice(&top.acc[p][..h]);
+            }
+            next.anchor = top.anchor;
+        }
+        state.len += 1;
+    }
+
+    // After a move was undone (with the hooks off): back to the previous ply's entry, or, if
+    // the move was applied before the net was attached (or copied), rebuilt from the board.
+    pub(crate) fn nnue_pop(&mut self) {
+        let mut state = self.nnue.take().unwrap();
+        if state.len > 1 {
+            state.len -= 1;
+        } else {
+            let NnueState { net, stack, .. } = &mut *state;
+            for color in [Color::White, Color::Black] {
+                net.rebuild(self, &mut stack[0], color);
             }
         }
         self.nnue = Some(state);
@@ -456,49 +513,60 @@ impl Board {
 
     // After a piece landed on `hex` (placed or moved there).
     pub(crate) fn nnue_on_insert(&mut self, hex: Hex, bug: Bug, color: Color) {
-        if bug == Bug::Queen {
-            return self.nnue_refresh();
-        }
         let level = self.height(hex) - 1;
         let mut state = self.nnue.take().unwrap();
-        let h = state.net.hidden;
+        let NnueState { net, stack, len } = &mut *state;
+        let entry = &mut stack[*len - 1];
+        let h = net.hidden;
         for p in [Color::White, Color::Black] {
-            let (dq, dr) = Nnue::offset(hex, Nnue::anchor(self, p));
-            let f = state.net.feature(dq, dr, color != p, bug, level);
-            add_row(&mut state.acc[p as usize][..h], &state.net.ft[f * h..(f + 1) * h]);
+            let anchor = Nnue::anchor(self, p);
+            if anchor != entry.anchor[p as usize] {
+                // A queen this perspective is anchored on moved: every offset changed.
+                net.rebuild(self, entry, p);
+                continue;
+            }
+            let (dq, dr) = Nnue::offset(hex, anchor);
+            let f = net.feature(dq, dr, color != p, bug, level);
+            add_row(&mut entry.acc[p as usize][..h], &net.ft[f * h..(f + 1) * h]);
         }
         self.nnue = Some(state);
     }
 
-    // Before the top piece of `hex` leaves (moved away or a placement undone). A leaving
-    // queen only loses its own row here; the anchors are redone by the insert that completes
-    // a move, or by the hand change that completes an undone placement.
+    // Before the top piece of `hex` leaves (moved away). A leaving queen only loses its own
+    // row here; the perspectives anchored on it are rebuilt by the insert that completes the
+    // move.
     pub(crate) fn nnue_on_remove(&mut self, hex: Hex) {
         let node = self.node(hex);
         let level = self.height(hex) - 1;
         let mut state = self.nnue.take().unwrap();
-        let h = state.net.hidden;
+        let NnueState { net, stack, len } = &mut *state;
+        let entry = &mut stack[*len - 1];
+        let h = net.hidden;
         for p in [Color::White, Color::Black] {
-            let (dq, dr) = Nnue::offset(hex, Nnue::anchor(self, p));
-            let f = state.net.feature(dq, dr, node.color() != p, node.bug(), level);
-            sub_row(&mut state.acc[p as usize][..h], &state.net.ft[f * h..(f + 1) * h]);
+            let (dq, dr) = Nnue::offset(hex, entry.anchor[p as usize]);
+            let f = net.feature(dq, dr, node.color() != p, node.bug(), level);
+            sub_row(&mut entry.acc[p as usize][..h], &net.ft[f * h..(f + 1) * h]);
         }
         self.nnue = Some(state);
     }
 
     // The count of `bug` in `color`'s hand changed by `delta` (the board already reflects it).
+    // A queen leaving the hand is when it starts to count as placed, so anchors can move here.
     pub(crate) fn nnue_on_hand(&mut self, bug: Bug, color: Color, delta: i8) {
-        if bug == Bug::Queen {
-            return self.nnue_refresh();
-        }
         let mut state = self.nnue.take().unwrap();
-        let h = state.net.hidden;
+        let NnueState { net, stack, len } = &mut *state;
+        let entry = &mut stack[*len - 1];
+        let h = net.hidden;
         let now = self.remaining[color as usize][bug as usize] as usize;
         let before = (now as i8 - delta) as usize;
         for p in [Color::White, Color::Black] {
+            if Nnue::anchor(self, p) != entry.anchor[p as usize] {
+                net.rebuild(self, entry, p);
+                continue;
+            }
             let slot = if color == p { 0 } else { 8 } + bug_index(bug);
-            sub_row(&mut state.acc[p as usize][..h], state.net.hand_row(slot, before));
-            add_row(&mut state.acc[p as usize][..h], state.net.hand_row(slot, now));
+            sub_row(&mut entry.acc[p as usize][..h], net.hand_row(slot, before));
+            add_row(&mut entry.acc[p as usize][..h], net.hand_row(slot, now));
         }
         self.nnue = Some(state);
     }
@@ -708,6 +776,88 @@ mod tests {
             }
         }
         assert!(history.len() > 20);
+    }
+
+    fn assert_matches_from_scratch(net: &Nnue, board: &Board, what: &str) {
+        let mut fresh = board.clone();
+        fresh.nnue = None;
+        assert_eq!(net.evaluate(board), net.evaluate(&fresh), "{what}");
+    }
+
+    // The search's pattern: along a random game, try children and grandchildren of every
+    // position (and a null move), undoing each, with the accumulators checked against a
+    // from scratch evaluation after every step.
+    #[test]
+    fn accumulator_stack_matches_from_scratch_in_search_trees() {
+        use minimax::{Game, Strategy};
+        for scalars in [0, NUM_SCALARS] {
+            let net = Arc::new(tiny_random(scalars));
+            let mut board = Board::from_game_type("Base+MLP").unwrap();
+            board.attach_nnue(net.clone());
+            let mut random = minimax::Random::<Rules>::new();
+            let (mut queen_placed, mut queen_moved) = (0, 0);
+            let mut count = |board: &Board, m: Turn| match m {
+                Turn::Place(_, Bug::Queen) => queen_placed += 1,
+                Turn::Move(start, _) if board.node(start).bug() == Bug::Queen => queen_moved += 1,
+                _ => {}
+            };
+            for ply in 0..90 {
+                if Rules::get_winner(&board).is_some() {
+                    break;
+                }
+                for _ in 0..4 {
+                    let child = random.choose_move(&board).unwrap();
+                    count(&board, child);
+                    board.apply(child);
+                    assert_matches_from_scratch(&net, &board, &format!("ply {ply} child"));
+                    if Rules::get_winner(&board).is_none() {
+                        for _ in 0..3 {
+                            let grandchild = random.choose_move(&board).unwrap();
+                            count(&board, grandchild);
+                            board.apply(grandchild);
+                            assert_matches_from_scratch(&net, &board, "grandchild");
+                            board.undo(grandchild);
+                            assert_matches_from_scratch(&net, &board, "grandchild undone");
+                        }
+                        board.apply(Turn::Pass);
+                        assert_matches_from_scratch(&net, &board, "null move");
+                        board.undo(Turn::Pass);
+                    }
+                    board.undo(child);
+                    assert_matches_from_scratch(&net, &board, &format!("ply {ply} child undone"));
+                }
+                let m = random.choose_move(&board).unwrap();
+                count(&board, m);
+                board.apply(m);
+                assert_matches_from_scratch(&net, &board, &format!("ply {ply}"));
+            }
+            assert!(queen_placed > 0 && queen_moved > 0, "{queen_placed} {queen_moved}");
+        }
+    }
+
+    // Undoing moves made before the net was attached, or before a copy was taken, rebuilds.
+    #[test]
+    fn undo_below_the_stack_rebuilds() {
+        let net = Arc::new(tiny_random(0));
+        let mut board = Board::from_game_string(
+            "Base;;;wA1;bA1 wA1-;wQ -wA1;bQ bA1-;wB1 wQ/;bB1 bQ-;wG1 /wQ;bB1 bQ",
+        )
+        .unwrap();
+        board.attach_nnue(net.clone());
+        let turns = board.turn_history.clone();
+        for &m in turns.iter().rev().take(4) {
+            board.undo(m);
+            assert_matches_from_scratch(&net, &board, "undo below attach");
+        }
+        let mut copy = board.clone();
+        for &m in &turns[turns.len() - 4..] {
+            copy.apply(m);
+        }
+        let mut copy2 = copy.clone();
+        for &m in turns.iter().rev().take(4) {
+            copy2.undo(m);
+            assert_matches_from_scratch(&net, &copy2, "undo below a copy");
+        }
     }
 
     // Like tiny() but with varied weights, so mismatches cannot cancel out; with scalars, a

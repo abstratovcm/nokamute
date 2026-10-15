@@ -354,6 +354,9 @@ pub enum Turn {
 
 impl Board {
     pub fn apply(&mut self, turn: Turn) {
+        if self.nnue.is_some() && turn != Turn::Pass {
+            self.nnue_push();
+        }
         match turn {
             Turn::Place(hex, bug) => {
                 let bug_num =
@@ -378,6 +381,8 @@ impl Board {
     }
 
     pub fn undo(&mut self, turn: Turn) {
+        // The learned evaluation keeps the previous ply's accumulators: no hooks on the way back.
+        let nnue = if turn == Turn::Pass { None } else { self.nnue.take() };
         self.turn_num -= 1;
         self.zobrist_history.pop();
         self.turn_history.pop();
@@ -396,6 +401,10 @@ impl Board {
                 self.insert(start, bug, bug_num, color);
             }
             Turn::Pass => {}
+        }
+        if nnue.is_some() {
+            self.nnue = nnue;
+            self.nnue_pop();
         }
     }
 }

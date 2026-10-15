@@ -94,22 +94,23 @@ fn main() {
     let mut attached_with128 = board.clone();
     attached_with128.attach_nnue(with128.0.clone());
     println!("nnue r6 h128 incr+s:   {}", easybench::bench(|| with128.evaluate(&attached_with128)));
-    // Cost of keeping them in step: one piece move (remove + insert) with and without.
+    // Cost of keeping them in step: one piece move (remove + insert) with and without, on
+    // one board as in the search (a fresh copy per move would time the copy instead).
     let m = minimax::Random::<Rules>::new().choose_move(&attached).unwrap();
+    let mut plain = board.clone();
     println!(
         "apply+undo plain:      {}",
         easybench::bench(|| {
-            let mut b = board.clone();
-            b.apply(m);
-            b.undo(m);
+            plain.apply(m);
+            plain.undo(m);
         })
     );
+    let mut incr = attached.clone();
     println!(
         "apply+undo incr:       {}",
         easybench::bench(|| {
-            let mut b = attached.clone();
-            b.apply(m);
-            b.undo(m);
+            incr.apply(m);
+            incr.undo(m);
         })
     );
 }
