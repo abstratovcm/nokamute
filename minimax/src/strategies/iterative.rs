@@ -125,6 +125,7 @@ pub struct IterativeOptions {
     pub(super) min_reorder_moves_depth: u8,
     pub(super) countermove_table: bool,
     pub(super) countermove_history_table: bool,
+    pub(super) late_move_reductions: bool,
     pub verbose: bool,
 }
 
@@ -143,6 +144,7 @@ impl IterativeOptions {
             min_reorder_moves_depth: u8::MAX,
             countermove_table: false,
             countermove_history_table: false,
+            late_move_reductions: false,
             verbose: false,
         }
     }
@@ -188,6 +190,13 @@ impl IterativeOptions {
     /// move (or only one reasonable move).
     pub fn with_singular_extension(mut self) -> Self {
         self.singular_extension = true;
+        self
+    }
+
+    /// Whether to search moves after the first few at a node (with at least 3 plies left)
+    /// first 2 plies shallower with a null window, and fully only if that beats alpha.
+    pub fn with_late_move_reductions(mut self) -> Self {
+        self.late_move_reductions = true;
         self
     }
 
@@ -473,8 +482,25 @@ where
         let mut best = WORST_EVAL;
         let mut best_move = moves[0];
         let mut null_window = false;
-        for &m in moves.iter() {
+        for (i, &m) in moves.iter().enumerate() {
+            // Late moves are probably worse than the ones tried first (the table's move, the
+            // countermove, then by history): a cheap shallower scout, the full search only if
+            // it suggests the move beats alpha. Tactical moves are never reduced.
+            let reduce = self.opts.late_move_reductions
+                && depth >= 3
+                && i >= 3
+                && E::G::reducible(s, m);
             let mut new = AppliedMove::<E::G>::new(s, m);
+            if reduce {
+                let scout = -self.negamax(&mut new, Some(m), depth - 2, -alpha - 1, -alpha)?;
+                if scout <= alpha {
+                    if scout > best {
+                        best = scout;
+                        best_move = m;
+                    }
+                    continue;
+                }
+            }
             let value = if null_window {
                 let probe = -self.negamax(&mut new, Some(m), depth - 1, -alpha - 1, -alpha)?;
                 if probe > alpha && probe < beta {

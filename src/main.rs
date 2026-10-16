@@ -29,6 +29,7 @@ engine flags:
  --double-step
  --quiet-search
  --null-move-pruning
+ --lmr
  --nnue=[path]"#,
         nokamute_version()
     );

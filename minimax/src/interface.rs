@@ -154,6 +154,11 @@ pub trait Game: Sized {
     fn max_table_index() -> u16 {
         0
     }
+    /// Whether a move may be searched at reduced depth (late move reductions); moves that
+    /// change the tactical situation should not be.
+    fn reducible(_: &Self::S, _: Self::M) -> bool {
+        true
+    }
 }
 
 /// Defines a method of choosing a move for the current player.

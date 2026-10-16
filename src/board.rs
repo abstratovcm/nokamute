@@ -988,6 +988,24 @@ impl minimax::Game for Rules {
     fn max_table_index() -> u16 {
         u16::MAX >> 2
     }
+
+    // Moves that start or end next to a placed queen (surrounding it, freeing it) or move a
+    // queen are searched at full depth. Placements never touch the enemy queen.
+    fn reducible(board: &Board, turn: Turn) -> bool {
+        let Turn::Move(start, end) = turn else {
+            return true;
+        };
+        for color in 0..2 {
+            if board.remaining[color][Bug::Queen as usize] == 0 {
+                let queen = board.queens[color];
+                let around = adjacent(queen);
+                if start == queen || around.contains(&start) || around.contains(&end) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 // Coordinates for populating test positions.
