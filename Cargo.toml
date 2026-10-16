@@ -46,3 +46,8 @@ harness = false
 # For wasm32 library builds.
 [lib]
 crate-type=["cdylib", "rlib"]
+
+# As the Colab notebooks build: 2-5% faster than the default, same output.
+[profile.release]
+lto = true
+codegen-units = 1

@@ -403,8 +403,16 @@ where
 
     pub(super) fn reorder(&self, prev: Option<G::M>, moves: &mut [G::M]) {
         if !self.history_table.is_empty() {
-            // Stable sort to preserve previous orderings.
-            moves.sort_by_key(|&m| !self.history_table[G::table_index(m) as usize]);
+            // Stable sort to preserve previous orderings. Moves that never caused a cutoff
+            // would all end up last in their current order, so only the others are sorted.
+            let mut counted = 0;
+            for i in 0..moves.len() {
+                if self.history_table[G::table_index(moves[i]) as usize] != 0 {
+                    moves[counted..i + 1].rotate_right(1);
+                    counted += 1;
+                }
+            }
+            moves[..counted].sort_by_key(|&m| !self.history_table[G::table_index(m) as usize]);
         }
         if let Some(prev) = prev {
             if let Some(response) = self.countermove_table.get(G::table_index(prev) as usize) {
@@ -437,5 +445,58 @@ where
 
         // Partially degrade old values, to bias towards new data.
         self.history_table.iter_mut().for_each(|n| *n >>= 3);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Moves are their own table index.
+    struct Indexed;
+
+    impl Game for Indexed {
+        type S = ();
+        type M = u16;
+        fn generate_moves(_: &(), _: &mut Vec<u16>) -> Option<Winner> {
+            None
+        }
+        fn apply(_: &mut (), _: u16) -> Option<()> {
+            None
+        }
+        fn get_winner(_: &()) -> Option<Winner> {
+            None
+        }
+        fn table_index(m: u16) -> u16 {
+            m
+        }
+        fn max_table_index() -> u16 {
+            63
+        }
+    }
+
+    #[test]
+    fn reorder_is_a_stable_sort_by_history() {
+        let mut seed = 1u64;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..200 {
+            let mut counters = CounterMoves::<Indexed>::new(false, true);
+            counters.advance_generation(None);
+            // Most moves never cut off, a few often, some counts equal.
+            for _ in 0..next(40) {
+                let m = next(64) as u16;
+                for _ in 0..1 + next(3) {
+                    counters.update(None, m);
+                }
+            }
+            let mut moves: Vec<u16> = (0..next(80)).map(|_| next(64) as u16).collect();
+            let mut expected = moves.clone();
+            expected.sort_by_key(|&m| !counters.history_table[m as usize]);
+            counters.reorder(None, &mut moves);
+            assert_eq!(moves, expected);
+        }
     }
 }
