@@ -277,8 +277,8 @@ impl Evaluator for BasicEvaluator {
 
 // The quiescence hook above, shared with the learned evaluator.
 pub(crate) fn noisy_moves(board: &Board, moves: &mut Vec<Turn>) {
-    if board.turn_history.len() < 4 || board.get_remaining()[Bug::Queen as usize] == 0 {
-        // Wait until movements are at least possible.
+    if board.turn_history.len() < 4 || board.get_remaining()[Bug::Queen as usize] > 0 {
+        // Wait until movements are at least possible (the queen is placed).
         return;
     }
     let enemy_last_move = board.turn_history[board.turn_history.len() - 1];
@@ -354,6 +354,33 @@ impl Evaluator for Eval {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Quiescence follows pieces just placed, once the side to move's queen is placed (no
+    // bug moves before that). The guard once had it backwards: noisy moves only before the
+    // queen, none after.
+    #[test]
+    fn noisy_moves_are_found_after_placements() {
+        use minimax::{Game, Strategy};
+        let mut found = 0;
+        for _ in 0..20 {
+            let mut board = Board::from_game_type("Base+MLP").unwrap();
+            let mut random = minimax::Random::<Rules>::new();
+            for _ in 0..60 {
+                if Rules::get_winner(&board).is_some() {
+                    break;
+                }
+                let mut moves = Vec::new();
+                noisy_moves(&board, &mut moves);
+                if board.get_remaining()[Bug::Queen as usize] > 0 {
+                    assert!(moves.is_empty());
+                } else {
+                    found += moves.len();
+                }
+                board.apply(random.choose_move(&board).unwrap());
+            }
+        }
+        assert!(found > 0);
+    }
 
     #[test]
     fn test_minimax() {
