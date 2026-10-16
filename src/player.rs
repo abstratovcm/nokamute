@@ -297,6 +297,9 @@ pub fn configure_player() -> Result<(PlayerConfig, Vec<String>), pico_args::Erro
     if args.contains("--lmr") {
         config.opts = config.opts.with_late_move_reductions();
     }
+    if args.contains("--partial-iteration") {
+        config.opts = config.opts.with_partial_iterations();
+    }
     if args.contains("--null-move-pruning") {
         config.opts = config.opts.with_null_move_depth(3);
     }

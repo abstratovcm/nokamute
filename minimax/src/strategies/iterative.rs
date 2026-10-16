@@ -126,6 +126,7 @@ pub struct IterativeOptions {
     pub(super) countermove_table: bool,
     pub(super) countermove_history_table: bool,
     pub(super) late_move_reductions: bool,
+    pub(super) partial_iterations: bool,
     pub verbose: bool,
 }
 
@@ -145,6 +146,7 @@ impl IterativeOptions {
             countermove_table: false,
             countermove_history_table: false,
             late_move_reductions: false,
+            partial_iterations: false,
             verbose: false,
         }
     }
@@ -197,6 +199,13 @@ impl IterativeOptions {
     /// first 2 plies shallower with a null window, and fully only if that beats alpha.
     pub fn with_late_move_reductions(mut self) -> Self {
         self.late_move_reductions = true;
+        self
+    }
+
+    /// Whether a timed out iteration still decides the move: the best of the root moves
+    /// it finished, if the previous best (searched first) is among them.
+    pub fn with_partial_iterations(mut self) -> Self {
+        self.partial_iterations = true;
         self
     }
 
@@ -548,8 +557,10 @@ where
         Some(())
     }
 
+    // `done` counts the moves searched to the end, the first ones of `moves`.
     pub(super) fn search_and_reorder(
         &mut self, s: &mut <E::G as Game>::S, moves: &mut [ValueMove<<E::G as Game>::M>], depth: u8,
+        done: &mut usize,
     ) -> Option<Evaluation> {
         let mut alpha = WORST_EVAL;
         let beta = BEST_EVAL;
@@ -559,6 +570,7 @@ where
 
             alpha = max(alpha, value);
             value_move.value = value;
+            *done += 1;
         }
         moves.sort_by_key(|vm| -vm.value);
         self.table.update(E::G::zobrist_hash(s), alpha, beta, depth, moves[0].value, moves[0].m);
@@ -709,6 +721,7 @@ where
         }
         while depth <= self.max_depth {
             interval_start = Instant::now();
+            let mut done = 0;
             let search = if self.opts.mtdf {
                 self.mtdf(&mut s_clone, depth, self.prev_value)
             } else {
@@ -738,10 +751,16 @@ where
                     }
                 }
 
-                self.negamaxer.search_and_reorder(&mut s_clone, &mut moves[..], depth)
+                self.negamaxer.search_and_reorder(&mut s_clone, &mut moves[..], depth, &mut done)
             };
             if search.is_none() {
-                // Timeout. Return the best move from the previous depth.
+                // Timeout. Return the best move from the previous depth, or the one this
+                // depth found among the moves it finished, the previous best first.
+                if self.opts.partial_iterations {
+                    if let Some(m) = best_finished(&moves[..done]) {
+                        best_move = Some(m);
+                    }
+                }
                 break;
             }
             let entry = self.negamaxer.table.lookup(root_hash).unwrap();
@@ -793,5 +812,36 @@ where
 
     fn principal_variation(&self) -> Vec<<E::G as Game>::M> {
         self.pv.clone()
+    }
+}
+
+// The best of the finished root moves of a timed out iteration, the first one among equal
+// values (as the sort after a full iteration would order them); None if none finished.
+// Values above the moves before them are exact, the others only bound their move from
+// above, so the maximum is a real value.
+fn best_finished<M: Copy>(moves: &[ValueMove<M>]) -> Option<M> {
+    let mut best: Option<&ValueMove<M>> = None;
+    for vm in moves {
+        if best.map_or(true, |b| vm.value > b.value) {
+            best = Some(vm);
+        }
+    }
+    best.map(|vm| vm.m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn best_finished_takes_the_first_best() {
+        let moves = |values: &[Evaluation]| {
+            values.iter().enumerate().map(|(i, &v)| ValueMove::new(v, i)).collect::<Vec<_>>()
+        };
+        assert_eq!(best_finished::<usize>(&[]), None);
+        assert_eq!(best_finished(&moves(&[5])), Some(0));
+        assert_eq!(best_finished(&moves(&[5, 7, 3])), Some(1));
+        assert_eq!(best_finished(&moves(&[5, 7, 7, -2])), Some(1));
+        assert_eq!(best_finished(&moves(&[5, 5])), Some(0));
     }
 }
