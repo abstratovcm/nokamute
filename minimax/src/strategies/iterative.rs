@@ -126,6 +126,9 @@ pub struct IterativeOptions {
     pub(super) countermove_table: bool,
     pub(super) countermove_history_table: bool,
     pub(super) late_move_reductions: bool,
+    pub(super) lmr_scale: Option<f64>,
+    pub(super) killers: bool,
+    pub(super) root_pvs: bool,
     pub(super) partial_iterations: bool,
     pub verbose: bool,
 }
@@ -146,6 +149,9 @@ impl IterativeOptions {
             countermove_table: false,
             countermove_history_table: false,
             late_move_reductions: false,
+            lmr_scale: None,
+            killers: false,
+            root_pvs: false,
             partial_iterations: false,
             verbose: false,
         }
@@ -199,6 +205,28 @@ impl IterativeOptions {
     /// first 2 plies shallower with a null window, and fully only if that beats alpha.
     pub fn with_late_move_reductions(mut self) -> Self {
         self.late_move_reductions = true;
+        self
+    }
+
+    /// Late move reductions that grow with the depth and how late the move is: the scout
+    /// is `ln(depth) * ln(index + 1) / scale` plies shallower (at least 1, as without it).
+    pub fn with_lmr_scale(mut self, scale: f64) -> Self {
+        self.late_move_reductions = true;
+        self.lmr_scale = Some(scale);
+        self
+    }
+
+    /// Whether to try first, after the table move, the last two moves that caused a cutoff
+    /// at the same depth left (killer moves).
+    pub fn with_killers(mut self) -> Self {
+        self.killers = true;
+        self
+    }
+
+    /// Whether root moves after the first get a null window scout first, and the full
+    /// window only if they beat the best so far.
+    pub fn with_root_pvs(mut self) -> Self {
+        self.root_pvs = true;
         self
     }
 
@@ -312,6 +340,10 @@ pub(super) struct Negamaxer<E: Evaluator, T> {
     pub(super) countermoves: CounterMoves<E::G>,
     move_pool: MovePool<<E::G as Game>::M>,
     eval: E,
+    // Extra plies of reduction by depth and move index, with `lmr_scale`.
+    reductions: Vec<u8>,
+    // Two killer moves per depth left, with `killers`.
+    killers: Vec<[Option<<E::G as Game>::M>; 2]>,
 
     opts: IterativeOptions,
     pub(crate) stats: Stats,
@@ -333,6 +365,12 @@ where
             countermoves: CounterMoves::new(opts.countermove_table, opts.countermove_history_table),
             eval,
             move_pool: MovePool::default(),
+            reductions: opts.lmr_scale.map_or(Vec::new(), |scale| {
+                (0..LMR_DEPTHS * LMR_INDEXES)
+                    .map(|k| lmr_reduction(k / LMR_INDEXES, k % LMR_INDEXES, scale))
+                    .collect()
+            }),
+            killers: if opts.killers { vec![[None; 2]; 256] } else { Vec::new() },
             opts,
             stats: Stats::default(),
         }
@@ -484,6 +522,11 @@ where
             // TODO reorder moves
         }
         self.countermoves.reorder(prev_move, &mut moves);
+        if let Some(killers) = self.killers.get(depth as usize) {
+            for killer in killers.iter().rev().flatten() {
+                move_to_front(*killer, &mut moves);
+            }
+        }
         if let Some(good) = good_move {
             move_to_front(good, &mut moves);
         }
@@ -501,7 +544,13 @@ where
                 && E::G::reducible(s, m);
             let mut new = AppliedMove::<E::G>::new(s, m);
             if reduce {
-                let scout = -self.negamax(&mut new, Some(m), depth - 2, -alpha - 1, -alpha)?;
+                let r = if self.reductions.is_empty() {
+                    1
+                } else {
+                    let d = (depth as usize).min(LMR_DEPTHS - 1);
+                    self.reductions[d * LMR_INDEXES + i.min(LMR_INDEXES - 1)].min(depth - 2)
+                };
+                let scout = -self.negamax(&mut new, Some(m), depth - 1 - r, -alpha - 1, -alpha)?;
                 if scout <= alpha {
                     if scout > best {
                         best = scout;
@@ -533,6 +582,11 @@ where
             }
             if alpha >= beta {
                 self.countermoves.update(prev_move, m);
+                if Some(m) != good_move {
+                    if let Some(killers) = self.killers.get_mut(depth as usize) {
+                        push_killer(killers, m);
+                    }
+                }
                 break;
             }
         }
@@ -564,9 +618,19 @@ where
     ) -> Option<Evaluation> {
         let mut alpha = WORST_EVAL;
         let beta = BEST_EVAL;
-        for value_move in moves.iter_mut() {
+        for (i, value_move) in moves.iter_mut().enumerate() {
             let mut new = AppliedMove::<E::G>::new(s, value_move.m);
-            let value = -self.negamax(&mut new, Some(value_move.m), depth - 1, -beta, -alpha)?;
+            let value = if self.opts.root_pvs && i > 0 {
+                let m = Some(value_move.m);
+                let scout = -self.negamax(&mut new, m, depth - 1, -alpha - 1, -alpha)?;
+                if scout > alpha {
+                    -self.negamax(&mut new, m, depth - 1, -beta, -alpha)?
+                } else {
+                    scout
+                }
+            } else {
+                -self.negamax(&mut new, Some(value_move.m), depth - 1, -beta, -alpha)?
+            };
 
             alpha = max(alpha, value);
             value_move.value = value;
@@ -692,6 +756,7 @@ where
     fn choose_move(&mut self, s: &<E::G as Game>::S) -> Option<<E::G as Game>::M> {
         self.negamaxer.table.advance_generation();
         self.negamaxer.countermoves.advance_generation(E::G::null_move(s));
+        self.negamaxer.killers.iter_mut().for_each(|k| *k = [None; 2]);
         // Reset stats.
         self.nodes_explored.clear();
         self.negamaxer.stats.reset();
@@ -815,6 +880,24 @@ where
     }
 }
 
+// A new killer goes first; the older one moves to second and the second is forgotten.
+fn push_killer<M: Copy + Eq>(killers: &mut [Option<M>; 2], m: M) {
+    if killers[0] != Some(m) {
+        killers[1] = killers[0];
+        killers[0] = Some(m);
+    }
+}
+
+const LMR_DEPTHS: usize = 64;
+const LMR_INDEXES: usize = 256;
+
+// Extra plies a late move's scout is reduced by: ln(depth) * ln(index + 1) / scale, at
+// least 1. The caller keeps the scout at depth 1 or more.
+fn lmr_reduction(depth: usize, index: usize, scale: f64) -> u8 {
+    let r = (depth.max(1) as f64).ln() * ((index + 1) as f64).ln() / scale;
+    (r as usize).clamp(1, u8::MAX as usize) as u8
+}
+
 // The best of the finished root moves of a timed out iteration, the first one among equal
 // values (as the sort after a full iteration would order them); None if none finished.
 // Values above the moves before them are exact, the others only bound their move from
@@ -843,5 +926,35 @@ mod tests {
         assert_eq!(best_finished(&moves(&[5, 7, 3])), Some(1));
         assert_eq!(best_finished(&moves(&[5, 7, 7, -2])), Some(1));
         assert_eq!(best_finished(&moves(&[5, 5])), Some(0));
+    }
+
+    #[test]
+    fn push_killer_keeps_the_last_two() {
+        let mut killers = [None; 2];
+        push_killer(&mut killers, 1);
+        assert_eq!(killers, [Some(1), None]);
+        push_killer(&mut killers, 2);
+        assert_eq!(killers, [Some(2), Some(1)]);
+        push_killer(&mut killers, 2);
+        assert_eq!(killers, [Some(2), Some(1)]);
+        push_killer(&mut killers, 3);
+        assert_eq!(killers, [Some(3), Some(2)]);
+    }
+
+    #[test]
+    fn lmr_reduction_grows_with_depth_and_index() {
+        // At the gating minimum (depth 3, 4th move) it is the fixed reduction.
+        assert_eq!(lmr_reduction(3, 3, 2.5), 1);
+        assert_eq!(lmr_reduction(0, 0, 2.5), 1);
+        assert_eq!(lmr_reduction(7, 40, 2.5), 2);
+        assert_eq!(lmr_reduction(8, 70, 2.0), 4);
+        for depth in 1..LMR_DEPTHS {
+            for index in 1..LMR_INDEXES {
+                let r = lmr_reduction(depth, index, 2.5);
+                assert!(r >= 1);
+                assert!(r >= lmr_reduction(depth - 1, index, 2.5));
+                assert!(r >= lmr_reduction(depth, index - 1, 2.5));
+            }
+        }
     }
 }

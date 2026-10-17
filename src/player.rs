@@ -297,6 +297,16 @@ pub fn configure_player() -> Result<(PlayerConfig, Vec<String>), pico_args::Erro
     if args.contains("--lmr") {
         config.opts = config.opts.with_late_move_reductions();
     }
+    let lmr_scale: Option<f64> = args.opt_value_from_str("--lmr-scale")?;
+    if let Some(scale) = lmr_scale {
+        config.opts = config.opts.with_lmr_scale(scale);
+    }
+    if args.contains("--root-pvs") {
+        config.opts = config.opts.with_root_pvs();
+    }
+    if args.contains("--killers") {
+        config.opts = config.opts.with_killers();
+    }
     if args.contains("--partial-iteration") {
         config.opts = config.opts.with_partial_iterations();
     }

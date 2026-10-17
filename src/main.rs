@@ -30,7 +30,10 @@ engine flags:
  --quiet-search
  --null-move-pruning
  --lmr
+ --lmr-scale=[float]
  --partial-iteration
+ --killers
+ --root-pvs
  --nnue=[path]"#,
         nokamute_version()
     );
