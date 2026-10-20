@@ -34,6 +34,7 @@ engine flags:
  --partial-iteration
  --killers
  --root-pvs
+ --rfp=[margin]
  --nnue=[path]"#,
         nokamute_version()
     );

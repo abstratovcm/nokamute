@@ -301,6 +301,10 @@ pub fn configure_player() -> Result<(PlayerConfig, Vec<String>), pico_args::Erro
     if let Some(scale) = lmr_scale {
         config.opts = config.opts.with_lmr_scale(scale);
     }
+    let rfp: Option<i16> = args.opt_value_from_str("--rfp")?;
+    if let Some(margin) = rfp {
+        config.opts = config.opts.with_rfp(margin);
+    }
     if args.contains("--root-pvs") {
         config.opts = config.opts.with_root_pvs();
     }

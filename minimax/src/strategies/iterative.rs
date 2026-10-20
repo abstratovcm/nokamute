@@ -129,6 +129,7 @@ pub struct IterativeOptions {
     pub(super) lmr_scale: Option<f64>,
     pub(super) killers: bool,
     pub(super) root_pvs: bool,
+    pub(super) rfp_margin: Option<Evaluation>,
     pub(super) partial_iterations: bool,
     pub verbose: bool,
 }
@@ -152,6 +153,7 @@ impl IterativeOptions {
             lmr_scale: None,
             killers: false,
             root_pvs: false,
+            rfp_margin: None,
             partial_iterations: false,
             verbose: false,
         }
@@ -227,6 +229,13 @@ impl IterativeOptions {
     /// window only if they beat the best so far.
     pub fn with_root_pvs(mut self) -> Self {
         self.root_pvs = true;
+        self
+    }
+
+    /// Reverse futility pruning: at null window nodes with at most 3 plies left, return the
+    /// evaluation without searching when it beats beta by `margin` per ply left.
+    pub fn with_rfp(mut self, margin: Evaluation) -> Self {
+        self.rfp_margin = Some(margin);
         self
     }
 
@@ -496,6 +505,17 @@ where
         let mut good_move = None;
         if let Some(value) = self.table.check(hash, depth, &mut good_move, &mut alpha, &mut beta) {
             return Some(value);
+        }
+
+        // A position already this far above beta near the leaves almost always fails high
+        // anyway: skip generating and searching its moves.
+        if let Some(margin) = self.opts.rfp_margin {
+            if depth <= 3 && beta as i32 - alpha as i32 == 1 && E::G::get_winner(s).is_none() {
+                let value = self.eval.evaluate(s);
+                if reverse_futile(value, depth, beta, margin) {
+                    return Some(value);
+                }
+            }
         }
 
         let mut moves = self.move_pool.alloc();
@@ -880,6 +900,11 @@ where
     }
 }
 
+// Whether `value` beats `beta` by at least `margin` per ply left.
+fn reverse_futile(value: Evaluation, depth: u8, beta: Evaluation, margin: Evaluation) -> bool {
+    value as i32 - margin as i32 * depth as i32 >= beta as i32
+}
+
 // A new killer goes first; the older one moves to second and the second is forgotten.
 fn push_killer<M: Copy + Eq>(killers: &mut [Option<M>; 2], m: M) {
     if killers[0] != Some(m) {
@@ -926,6 +951,17 @@ mod tests {
         assert_eq!(best_finished(&moves(&[5, 7, 3])), Some(1));
         assert_eq!(best_finished(&moves(&[5, 7, 7, -2])), Some(1));
         assert_eq!(best_finished(&moves(&[5, 5])), Some(0));
+    }
+
+    #[test]
+    fn reverse_futile_needs_the_margin_per_ply() {
+        assert!(reverse_futile(300, 1, 200, 100));
+        assert!(!reverse_futile(299, 1, 200, 100));
+        assert!(reverse_futile(500, 3, 200, 100));
+        assert!(!reverse_futile(499, 3, 200, 100));
+        // No overflow near the limits of the evaluation.
+        assert!(!reverse_futile(Evaluation::MIN + 1, 3, Evaluation::MAX, 300));
+        assert!(reverse_futile(Evaluation::MAX, 1, Evaluation::MIN + 1, 300));
     }
 
     #[test]
