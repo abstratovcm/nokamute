@@ -31,6 +31,14 @@ pub fn nokamute_version() -> &'static str {
     version.strip_prefix('v').unwrap_or(version)
 }
 
+// tocandira's name and version, with the nokamute it is built on.
+pub const ENGINE_NAME: &str = "tocandira";
+pub const ENGINE_VERSION: &str = "0.1.0";
+
+pub fn engine_id() -> String {
+    format!("{} {} (nokamute {})", ENGINE_NAME, ENGINE_VERSION, nokamute_version())
+}
+
 impl Board {
     // New board from UHP GameTypeString, e.g. "Base+MLP"
     pub fn from_game_type(game_type: &str) -> Result<Self> {

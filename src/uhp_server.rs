@@ -28,7 +28,7 @@ impl<W: Write> UhpServer<W> {
     }
 
     fn info(&mut self) -> Result<()> {
-        writeln!(self.output, "id {} {}", env!("CARGO_PKG_NAME"), nokamute_version())?;
+        writeln!(self.output, "id {}", engine_id())?;
         // Capabilities
         writeln!(self.output, "Mosquito;Ladybug;Pillbug")?;
         Ok(())
@@ -624,6 +624,14 @@ mod tests {
         outs.push(command(&mut server, "search depth 3"));
         assert!(!outs[0].contains("err"), "{outs:?}");
         assert!(outs.iter().all(|out| out == &outs[0]), "{outs:?}");
+    }
+
+    #[test]
+    fn info_names_tocandira_and_nokamute() {
+        let mut server = test_server();
+        let info = command(&mut server, "info");
+        assert!(info.starts_with("id tocandira "), "{info}");
+        assert!(info.contains("(nokamute "), "{info}");
     }
 
     #[test]

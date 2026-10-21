@@ -6,7 +6,7 @@ use std::ffi::OsString;
 #[cfg(not(target_arch = "wasm32"))]
 fn help() {
     println!(
-        r#"nokamute hive engine {}
+        r#"{}: a hive engine built on nokamute by Eric Roshan-Eisner
 
 commands:
  cli:   Interactive interface to a board
@@ -37,7 +37,7 @@ engine flags:
  --root-pvs
  --rfp=[margin]
  --nnue=[path]"#,
-        nokamute_version()
+        engine_id()
     );
 }
 

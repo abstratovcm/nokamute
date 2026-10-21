@@ -6,7 +6,7 @@ use crate::cli::CliPlayer;
 use crate::mcts::BiasedRollouts;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::uhp_client::UhpPlayer;
-use crate::{nokamute_version, Board, Bug, Eval, Rules, Turn};
+use crate::{engine_id, Board, Bug, Eval, Rules, Turn};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{Nnue, NnueEvaluator};
 use minimax::*;
@@ -145,7 +145,7 @@ struct NokamutePlayer {
 
 impl NokamutePlayer {
     fn new(strategy: Box<dyn ScoredStrategy>, eval: &Eval, random_opening: bool) -> Self {
-        let name = format!("nokamute {}", nokamute_version());
+        let name = engine_id();
         Self::new_with_name(&name, strategy, eval, random_opening)
     }
 

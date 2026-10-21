@@ -1,5 +1,10 @@
 # Nokamute #
 
+This branch is the engine of [tocandira](https://github.com/abstratovcm/tocandira): nokamute
+(Eric Roshan-Eisner's hive AI, MIT) with a learned NNUE evaluation, strategy scalars and
+search additions. It answers UHP's `info` as `tocandira <version> (nokamute <version>)`.
+The rest of this README is nokamute's.
+
 Nokamute is a hive AI focused on speed.
 
 ## Features ##
