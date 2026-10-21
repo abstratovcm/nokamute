@@ -305,6 +305,9 @@ pub fn configure_player() -> Result<(PlayerConfig, Vec<String>), pico_args::Erro
     if let Some(margin) = rfp {
         config.opts = config.opts.with_rfp(margin);
     }
+    if args.contains("--lmr-history") {
+        config.opts = config.opts.with_lmr_history();
+    }
     if args.contains("--root-pvs") {
         config.opts = config.opts.with_root_pvs();
     }

@@ -31,6 +31,7 @@ engine flags:
  --null-move-pruning
  --lmr
  --lmr-scale=[float]
+ --lmr-history
  --partial-iteration
  --killers
  --root-pvs

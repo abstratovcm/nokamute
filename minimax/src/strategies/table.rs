@@ -421,6 +421,11 @@ where
         }
     }
 
+    // How many cutoffs `m` has caused (0 without the history table).
+    pub(super) fn history(&self, m: G::M) -> u32 {
+        self.history_table.get(G::table_index(m) as usize).copied().unwrap_or(0)
+    }
+
     pub(super) fn update(&mut self, prev: Option<G::M>, m: G::M) {
         if let Some(prev) = prev {
             if let Some(entry) = self.countermove_table.get_mut(G::table_index(prev) as usize) {
@@ -498,5 +503,16 @@ mod tests {
             counters.reorder(None, &mut moves);
             assert_eq!(moves, expected);
         }
+    }
+
+    #[test]
+    fn history_counts_cutoffs() {
+        let mut counters = CounterMoves::<Indexed>::new(false, true);
+        assert_eq!(counters.history(5), 0);
+        counters.advance_generation(None);
+        counters.update(None, 5);
+        counters.update(None, 5);
+        assert_eq!(counters.history(5), 2);
+        assert_eq!(counters.history(6), 0);
     }
 }
